@@ -26,7 +26,7 @@ import requests
 
 # IMPORTANT: SEC EDGAR asks every request to declare a User-Agent that
 # identifies the user. Replace the email below if you fork this app.
-USER_AGENT = "FilingDiff Research Tool (educational use) contact@example.com"
+USER_AGENT = "FilingDiff Research Tool (educational use) skylarhtian@gmail.com"
 
 # Be polite: SEC asks for <= 10 req/sec. We go a bit slower to be safe.
 _MIN_INTERVAL_SEC = 0.15

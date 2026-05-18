@@ -209,10 +209,23 @@ TOPIC_METRICS: dict[str, list[tuple[str, str]]] = {
 
 @dataclass
 class DriverNote:
+    """Structured analyst-style driver card.
+
+    Each card is one synthesised view of a single driver category --
+    duplicates are merged at synthesis time, not at render time. The
+    card answers: what changed, in which direction, by how much, due to
+    what, with what financial impact, and what an analyst should take
+    away.
+    """
+
     category: str
-    excerpt: str  # raw source sentence
-    causal_phrase: str
-    headline: str = ""  # analyst-voice polished bullet
+    headline: str  # one-sentence summary with direction + magnitude
+    driver: str  # "Driver: ..." bullet body
+    financial_impact: str  # "Financial impact: ..." bullet body
+    investment_read: str  # "Investment read: ..." bullet body
+    direction: str  # "increased" | "decreased" | "improved" | "worsened" | "mixed" | "unclear"
+    confidence: str  # "high" | "medium" | "low"
+    excerpts: list  # list[str] raw source sentences for the evidence expander
 
 
 @dataclass
@@ -258,6 +271,11 @@ def _find_sentence_with(text: str, phrase: str) -> Optional[str]:
 
 def _classify_driver_category(text: str) -> str:
     low = text.lower()
+    # OEC-style segment split: if a sentence compares both Specialty and
+    # Rubber segments, classify it as Segment / Geographic Mix even though
+    # it contains "volume" (which would otherwise win Pricing/Volume/Mix).
+    if "specialty" in low and "rubber" in low:
+        return "Segment / Geographic Mix"
     for label, words in DRIVER_CATEGORIES:
         if any(w in low for w in words):
             return label
@@ -307,49 +325,24 @@ def _looks_like_clean_sentence(sent: str) -> bool:
     return True
 
 
-def extract_drivers(paragraphs, *, max_per_category: int = 2) -> list[DriverNote]:
-    """Find driver sentences in the latest filing, bucketed by category.
-
-    Each returned DriverNote includes an analyst-voice ``headline`` that
-    the UI renders by default. The raw source ``excerpt`` is only shown
-    inside the collapsed evidence expander.
-    """
-    by_cat: dict[str, list[DriverNote]] = defaultdict(list)
-    seen_keys: set[str] = set()
-
-    for p in paragraphs:
-        text = p.text if hasattr(p, "text") else str(p)
-        low = text.lower()
-        for phrase in CAUSAL_PHRASES:
-            if phrase not in low:
-                continue
-            sent = _find_sentence_with(text, phrase)
-            if not sent or not _looks_like_clean_sentence(sent):
-                continue
-            key = re.sub(r"\W+", "", sent.lower())[:80]
-            if key in seen_keys:
-                continue
-            cat = _classify_driver_category(sent)
-            if len(by_cat[cat]) >= max_per_category:
-                break
-            seen_keys.add(key)
-            note = DriverNote(category=cat, excerpt=sent, causal_phrase=phrase)
-            note.headline = polish_driver_headline(note)
-            by_cat[cat].append(note)
-            break  # one driver per paragraph
-
-    out: list[DriverNote] = []
-    for label, _ in DRIVER_CATEGORIES:
-        out.extend(by_cat.get(label, []))
-    out.extend(by_cat.get("Other", []))
-    return out
-
-
 # ---------------------------------------------------------------------------
-# Driver -> analyst-voice headline
+# Driver synthesis (richer than the old polished-headline approach)
+#
+# Each driver card now answers six questions:
+#   - What changed?
+#   - Direction (increased / decreased / improved / worsened / compressed / expanded)
+#   - Magnitude, if available
+#   - Cause
+#   - Financial impact on revenue / margin / earnings / cash / liquidity
+#   - Why it matters (investment read)
+#
+# We never emit vague verbs ("moved", "affected", "contributed") on their
+# own. If we cannot determine direction, we say so explicitly.
 # ---------------------------------------------------------------------------
 
 
+# Stricter directional verb sets used at the *card* level. Word-boundary
+# matched so "favorable" never lights up on "unfavorably".
 _POS_VERBS = (
     "higher", "increased", "growth", "favorable", "favorably",
     "expanded", "improved", "stronger", "rose", "grew", "benefited",
@@ -359,13 +352,7 @@ _NEG_VERBS = (
     "lower", "declined", "decreased", "unfavorable", "unfavorably",
     "weaker", "compressed", "pressured", "fell", "weighed",
     "headwind", "softness",
-    # Keep "soft" as a word match so we don't trip on "software" or
-    # "softness" (already covered). Compiled below as a word-boundary
-    # regex.
 )
-
-# Compile word-boundary patterns so "favorable" does not match
-# "unfavorably" and "soft" does not match "software".
 _POS_RE = re.compile(r"\b(?:" + "|".join(_POS_VERBS) + r")\b", re.IGNORECASE)
 _NEG_RE = re.compile(r"\b(?:" + "|".join(_NEG_VERBS) + r"|soft)\b", re.IGNORECASE)
 
@@ -390,8 +377,8 @@ def _cause_clause(sent: str, causal_phrase: str) -> Optional[str]:
     if idx < 0:
         return None
     rest = sent[idx + len(causal_phrase):].lstrip(" ,;:")
-    # Truncate at any offset-connector phrase within the clause so the
-    # primary driver is not contaminated by the counter-trend description.
+    # Truncate at any offset-connector phrase so the cause clause reflects
+    # the primary driver, not the counter-trend.
     rest_low = rest.lower()
     for offset_marker in ("partially offset by", ", offset by", " offset by"):
         oi = rest_low.find(offset_marker)
@@ -402,111 +389,859 @@ def _cause_clause(sent: str, causal_phrase: str) -> Optional[str]:
     if cut:
         rest = rest[: cut.start()]
     rest = rest.strip()
-    # Lowercase first letter for grammatical continuity (unless it's an
-    # acronym like "FX" / "EMEA").
-    if rest and rest[0].isupper() and not (
-        len(rest) >= 2 and rest[1].isupper()
-    ):
+    if rest and rest[0].isupper() and not (len(rest) >= 2 and rest[1].isupper()):
         rest = rest[0].lower() + rest[1:]
-    # Strip awkward trailing connector words.
     rest = re.sub(r"\s+(?:and|but|while|although|though)$", "", rest)
-    if not 8 <= len(rest) <= 150:
+    if not 8 <= len(rest) <= 160:
         return None
     return rest
 
 
-def polish_driver_headline(d: DriverNote) -> str:
-    """Produce an analyst-voice headline bullet for a driver.
+# Subject regexes -- "what is moving" in the sentence.
+_SUBJ_VOLUME = re.compile(r"\bvolume[s]?\b", re.IGNORECASE)
+_SUBJ_PRICE = re.compile(
+    r"\b(?:price[s]?|pricing|asp|average\s+selling\s+price|contractual\s+pric)",
+    re.IGNORECASE,
+)
+_SUBJ_MIX = re.compile(
+    r"\b(?:product\s+mix|regional\s+mix|geographic\s+mix|customer\s+mix|mix)\b",
+    re.IGNORECASE,
+)
+_SUBJ_RECV = re.compile(r"\b(?:accounts\s+receivable|receivables|dso|days\s+sales)\b", re.IGNORECASE)
+_SUBJ_INV = re.compile(r"\b(?:inventor(?:y|ies))\b", re.IGNORECASE)
+_SUBJ_PAY = re.compile(r"\b(?:accounts\s+payable|payables)\b", re.IGNORECASE)
+_SUBJ_FEED = re.compile(r"\b(?:feedstock|raw\s+material|oil\s+price|pass[-\s]through)\b", re.IGNORECASE)
+_SUBJ_FREIGHT = re.compile(r"\b(?:freight|logistics|energy\s+cost|labor\s+cost)\b", re.IGNORECASE)
+_SUBJ_SPECIALTY = re.compile(r"\bspecialty\s+carbon\b|\bspecialty\b", re.IGNORECASE)
+_SUBJ_RUBBER = re.compile(r"\brubber\s+carbon\b|\brubber\b", re.IGNORECASE)
 
-    The headline is templated by category + detected subject + direction
-    and ends with the trimmed cause clause from the source. Falls back
-    to a tidy generic phrasing if nothing distinctive is detected.
+_UNFAVORABLE_RE = re.compile(r"\bunfavorab", re.IGNORECASE)
+_FAVORABLE_RE = re.compile(r"(?<!un)\bfavorab", re.IGNORECASE)
+_TAILWIND_RE = re.compile(r"\btailwind\b|\b(?:benefit|benefited)\b", re.IGNORECASE)
+_HEADWIND_RE = re.compile(r"\bheadwind\b|\b(?:weighed|pressured|hurt)\b", re.IGNORECASE)
+
+
+@dataclass
+class _CategorySignals:
+    """Per-category bucket of evidence accumulated across the filing."""
+
+    sentences: list  # list[str]
+    causes: list  # list[str] -- extracted cause-clause fragments
+    pos_hits: int = 0
+    neg_hits: int = 0
+
+    def __init__(self) -> None:
+        self.sentences = []
+        self.causes = []
+        self.pos_hits = 0
+        self.neg_hits = 0
+
+    def add(self, sent: str, cause: Optional[str], dir_in_primary: str) -> None:
+        if sent not in self.sentences:
+            self.sentences.append(sent)
+        if cause and cause not in self.causes:
+            self.causes.append(cause)
+        if dir_in_primary == "positive":
+            self.pos_hits += 1
+        elif dir_in_primary == "negative":
+            self.neg_hits += 1
+        elif dir_in_primary == "mixed":
+            self.pos_hits += 1
+            self.neg_hits += 1
+
+
+def _collect_signals(paragraphs) -> dict[str, _CategorySignals]:
+    """Walk paragraphs once and bucket evidence sentences into categories.
+
+    Pass 1: every sentence containing a causal phrase ("driven by", "due
+    to", ...) is classified into exactly one category. Direction is read
+    from the *primary* clause only -- anything after a "partially offset
+    by" connector is stripped so an offset positive cannot cancel a
+    lead-driver negative.
+
+    Pass 2: pick up sentences that lack a causal phrase but still convey
+    a clear directional + magnitude signal for a specific driver subject
+    (FX tailwind / headwind, working-capital use / source, cost
+    inflation, etc.). This catches lines like "FX contributed a tailwind
+    of approximately $1.0 million" which an SEC writer is unlikely to
+    decorate with a causal connector.
     """
-    low = d.excerpt.lower()
-    # Compute direction from the primary clause only — strip the "partially
-    # offset by ..." tail so a counter-trend positive doesn't cancel the
-    # lead-driver signal ("unfavorably impacted by FX, partially offset by
-    # higher margin" should read as negative, not mixed).
-    primary_clause = d.excerpt
-    for offset_marker in ("partially offset by", ", offset by", " offset by"):
-        oi = low.find(offset_marker)
-        if oi > 0:
-            primary_clause = d.excerpt[:oi]
-            break
-    direction = _direction(primary_clause)
-    cause = _cause_clause(d.excerpt, d.causal_phrase)
-    # When the matched phrase is an offset connector (e.g. "partially
-    # offset by"), the cause clause describes the *counter-trend*, not
-    # the primary driver. Surface it parenthetically so the reader
-    # doesn't confuse the offset for the lead.
-    if d.causal_phrase in ("partially offset by", "offset by"):
-        cause_tail = f" (partially offset by {cause})" if cause else ""
+    out: dict[str, _CategorySignals] = defaultdict(_CategorySignals)
+    seen_sentences: set[str] = set()
+
+    # Pass 1 — causal-phrase based.
+    for p in paragraphs:
+        text = p.text if hasattr(p, "text") else str(p)
+        for sent in _sentences(text):
+            slow = sent.lower()
+            if not _looks_like_clean_sentence(sent):
+                continue
+            matched_phrase = next(
+                (cp for cp in CAUSAL_PHRASES if cp in slow), None
+            )
+            if not matched_phrase:
+                continue
+            cat = _classify_driver_category(sent)
+            primary = sent
+            for offset_marker in ("partially offset by", ", offset by", " offset by"):
+                oi = slow.find(offset_marker)
+                if oi > 0:
+                    primary = sent[:oi]
+                    break
+            cause = _cause_clause(sent, matched_phrase)
+            out[cat].add(sent, cause, _direction(primary))
+            seen_sentences.add(sent)
+
+    # Pass 2 — subject + direction + magnitude, no causal phrase required.
+    for p in paragraphs:
+        text = p.text if hasattr(p, "text") else str(p)
+        for sent in _sentences(text):
+            if sent in seen_sentences:
+                continue
+            if not _looks_like_clean_sentence(sent):
+                continue
+            slow = sent.lower()
+            cat = _supplemental_category(sent, slow)
+            if not cat:
+                continue
+            out[cat].add(sent, None, _direction(sent))
+            seen_sentences.add(sent)
+
+    return out
+
+
+def _supplemental_category(sent: str, slow: str) -> Optional[str]:
+    """Classify a non-causal sentence into a driver category when the
+    subject is unambiguous and we have a direction or magnitude signal.
+    Returns None otherwise so the sentence is skipped.
+    """
+    has_dollar = bool(_RE_DOLLAR.search(sent))
+    has_pct = bool(_RE_PCT.search(sent))
+    has_kmt = bool(_RE_KMT.search(sent))
+    has_mag = has_dollar or has_pct or has_kmt
+
+    # Foreign Exchange -- subject + direction word is enough; magnitude
+    # bumps confidence later.
+    if re.search(r"\b(?:foreign\s+exchange|currency\s+translation|currency|\bfx\b|translation)\b", slow):
+        if (
+            _TAILWIND_RE.search(sent) or _HEADWIND_RE.search(sent)
+            or _FAVORABLE_RE.search(sent) or _UNFAVORABLE_RE.search(sent)
+            or "weakened" in slow or "strengthened" in slow
+            or has_mag
+        ):
+            return "Foreign Exchange"
+
+    # Working Capital -- explicit "use of cash" / "source of cash" wording.
+    if re.search(r"\bworking\s+capital\b", slow):
+        if (
+            "use of cash" in slow or "cash use" in slow
+            or "source of cash" in slow or "released" in slow
+            or _SUBJ_RECV.search(slow) or _SUBJ_INV.search(slow)
+        ):
+            return "Working Capital"
+
+    # Cost Inflation -- input-cost subject with a direction signal.
+    if _SUBJ_FEED.search(slow) or _SUBJ_FREIGHT.search(slow) or "input cost" in slow:
+        if _POS_RE.search(sent) or _NEG_RE.search(sent) or has_mag:
+            return "Cost Inflation / Input Costs"
+
+    # Segment-level OEC / multi-region split.
+    if "specialty" in slow and "rubber" in slow:
+        return "Segment / Geographic Mix"
+
+    return None
+
+
+# Numeric magnitude extraction ------------------------------------------------
+
+_RE_KMT = re.compile(r"(-?\d+(?:\.\d+)?)\s*kmt\b", re.IGNORECASE)
+_RE_DOLLAR = re.compile(
+    r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?\s*(?:billion|million|thousand|B|M|K)?",
+    re.IGNORECASE,
+)
+_RE_PCT = re.compile(r"-?\d+(?:\.\d+)?\s*%")
+_RE_BPS = re.compile(r"-?\d+\s*(?:bps|basis\s+points)\b", re.IGNORECASE)
+
+
+def _first_dollar(text: str) -> Optional[str]:
+    m = _RE_DOLLAR.search(text)
+    return m.group(0).strip() if m else None
+
+
+def _first_pct(text: str) -> Optional[str]:
+    m = _RE_PCT.search(text)
+    return m.group(0).strip() if m else None
+
+
+def _first_kmt(text: str) -> Optional[str]:
+    m = _RE_KMT.search(text)
+    if not m:
+        return None
+    return f"{m.group(1)} kmt"
+
+
+def _volume_change(text: str) -> Optional[tuple[str, Optional[str]]]:
+    """Detect 'volume increased X kmt ... to Y kmt' patterns.
+
+    Returns (change_amount, total_after) or None. ``total_after`` may be
+    None if only the delta was disclosed.
+    """
+    # "increased 4.8 kmt year over year to 256.5 kmt"
+    m = re.search(
+        r"volume[s]?\s+(?:increased|decreased|grew|declined|rose|fell)\s+"
+        r"(?:by\s+)?(\d+(?:\.\d+)?)\s*kmt"
+        r"(?:[^.]{0,80}?to\s+(\d+(?:\.\d+)?)\s*kmt)?",
+        text, re.IGNORECASE,
+    )
+    if m:
+        change = f"{m.group(1)} kmt"
+        total = f"{m.group(2)} kmt" if m.group(2) else None
+        return change, total
+    return None
+
+
+# Per-category synthesizers ---------------------------------------------------
+
+
+def _conf_from_signals(sigs: _CategorySignals, has_magnitude: bool) -> str:
+    n_sent = len(sigs.sentences)
+    if has_magnitude and n_sent >= 1 and (sigs.pos_hits + sigs.neg_hits) >= 1:
+        return "high"
+    if n_sent >= 1 and (sigs.pos_hits + sigs.neg_hits) >= 1:
+        return "medium"
+    return "low"
+
+
+def _undetermined(category: str, sigs: _CategorySignals) -> Optional[DriverNote]:
+    """Emit an honest 'direction not detected' card instead of a vague one."""
+    if not sigs.sentences:
+        return None
+    return DriverNote(
+        category=category,
+        headline=f"{category}: direction not clearly detected — see source filing.",
+        driver="",
+        financial_impact="",
+        investment_read="",
+        direction="unclear",
+        confidence="low",
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _join_clauses(parts: list[str]) -> str:
+    parts = [p.strip().rstrip(".") for p in parts if p and p.strip()]
+    if not parts:
+        return ""
+    s = ". ".join(parts)
+    return s.rstrip(".") + "."
+
+
+def _synth_pricing_volume_mix(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    low = text_all.lower()
+
+    # Volume direction & magnitude.
+    vc = _volume_change(text_all)
+    vol_dir = None
+    for s in sigs.sentences:
+        if not _SUBJ_VOLUME.search(s):
+            continue
+        if re.search(r"\bvolume[s]?\s+(?:increased|grew|rose|expanded|higher)\b", s, re.IGNORECASE):
+            vol_dir = "up"
+        elif re.search(r"\bvolume[s]?\s+(?:decreased|declined|fell|lower|weaker)\b", s, re.IGNORECASE):
+            vol_dir = "down"
+    if not vol_dir and vc:
+        # Fallback: assume vc reflects whatever the sentence verb said.
+        # _volume_change requires a movement verb in its regex, so this
+        # branch typically infers "up" for increases. Use a conservative
+        # secondary check.
+        for s in sigs.sentences:
+            if "volume" in s.lower() and _DIRECTION_DOWN_RE.search(s):
+                vol_dir = "down"; break
+            if "volume" in s.lower() and _DIRECTION_UP_RE.search(s):
+                vol_dir = "up"; break
+
+    # Price / mix direction.
+    price_neg = bool(re.search(r"\b(?:lower|unfavorab|reduced)\s+(?:contractual\s+)?pric", low))
+    price_pos = bool(re.search(r"\b(?:higher|favorab|stronger)\s+(?:contractual\s+)?pric", low))
+    mix_neg = bool(re.search(r"unfavorable[^.]{0,40}\bmix\b|mix\b[^.]{0,40}\bunfavorab", low))
+    mix_pos = bool(re.search(r"\bfavorab[^.]{0,40}\bmix\b|\bmix\b[^.]{0,40}\bfavorab", low))
+
+    has_magnitude = bool(vc) or bool(_first_pct(text_all))
+    confidence = _conf_from_signals(sigs, has_magnitude)
+
+    # Build the driver bullet in two layered clauses so the prose flows.
+    volume_clause = ""
+    if vol_dir == "up" and vc:
+        change, total = vc
+        volume_clause = (
+            f"Volume increased {change} year over year to {total}" if total
+            else f"Volume increased {change} year over year"
+        )
+    elif vol_dir == "down" and vc:
+        change, total = vc
+        volume_clause = (
+            f"Volume decreased {change} year over year to {total}" if total
+            else f"Volume decreased {change} year over year"
+        )
+    elif vol_dir == "up":
+        volume_clause = "Volume was higher year over year"
+    elif vol_dir == "down":
+        volume_clause = "Volume was lower year over year"
+    if volume_clause and sigs.causes:
+        volume_clause += f", driven by {sigs.causes[0]}"
+    pressure_clause = ""
+    if mix_neg or price_neg:
+        bits = []
+        if price_neg:
+            bits.append("lower contractual pricing")
+        if mix_neg:
+            bits.append("unfavorable product / regional mix")
+        pressure_clause = ", ".join(bits) + " pressured profitability"
+    if volume_clause and pressure_clause:
+        driver = f"{volume_clause}. {pressure_clause[0].upper()}{pressure_clause[1:]}."
+    elif volume_clause:
+        driver = f"{volume_clause}."
+    elif pressure_clause:
+        driver = f"{pressure_clause[0].upper()}{pressure_clause[1:]}."
     else:
-        cause_tail = f" — {cause}" if cause else ""
+        driver = ""
 
-    cat = d.category
-    # Pricing / Volume / Mix
-    if cat == "Pricing / Volume / Mix":
-        if "volume" in low and direction == "positive":
-            return f"Higher volumes contributed to revenue growth{cause_tail}."
-        if "volume" in low and direction == "negative":
-            return f"Lower volumes weighed on revenue{cause_tail}."
-        if ("price" in low or "pricing" in low or "asp" in low) and direction == "positive":
-            return f"Pricing actions supported revenue and margins{cause_tail}."
-        if ("price" in low or "pricing" in low or "asp" in low) and direction == "negative":
-            return f"Pricing pressure compressed margins{cause_tail}."
-        if "mix" in low and direction == "positive":
-            return f"Favorable product/customer mix lifted reported results{cause_tail}."
-        if "mix" in low and direction == "negative":
-            return f"Unfavorable mix pressured reported results{cause_tail}."
-        return f"Price, volume, and mix dynamics drove the period's variance{cause_tail}."
+    # Headline + financial impact + read.
+    if vol_dir == "up" and (price_neg or mix_neg):
+        headline = "Volumes improved, but mix and pricing hurt profitability."
+        direction = "mixed"
+        fi = (
+            "Despite higher volume, revenue declined because product / regional "
+            "mix and contractual pricing were unfavorable. Gross profit and "
+            "operating income compressed as a result."
+        )
+        read = (
+            "Demand is not the main problem; margin quality and pricing are "
+            "the pressure points. Watch for stabilisation in contractual "
+            "pricing and a mix shift back toward higher-spec products."
+        )
+    elif vol_dir == "up" and (price_pos or mix_pos):
+        headline = "Volumes and pricing both supported revenue and margin."
+        direction = "increased"
+        fi = "Higher volume combined with favorable mix / pricing lifted revenue and gross profit."
+        read = "Cleanest setup possible — sustainability is the question; watch for any pricing rollover."
+    elif vol_dir == "down" and not (price_pos or mix_pos):
+        headline = "Lower volumes weighed on revenue and gross profit."
+        direction = "decreased"
+        fi = "Volume softness flowed through to revenue and gross profit; pricing did not offset."
+        read = "Volume weakness is the more structural worry — confirm whether it reflects end-market or share loss."
+    elif vol_dir == "down" and (price_pos or mix_pos):
+        headline = "Volumes declined, partially offset by stronger pricing / mix."
+        direction = "mixed"
+        fi = "Pricing and mix mitigated the volume decline at the gross profit line."
+        read = "Pricing discipline is intact, but the volume slope still matters more for the next print."
+    elif vol_dir is None and (price_neg or mix_neg):
+        headline = "Pricing and / or mix were unfavorable this period."
+        direction = "decreased"
+        fi = "Margin compression visible on the gross profit / operating income lines."
+        read = "Watch for evidence of contractual pricing reset and product-mix normalisation."
+    elif vol_dir is None and (price_pos or mix_pos):
+        headline = "Pricing and / or mix were favorable this period."
+        direction = "increased"
+        fi = "Margin expansion from price / mix even without explicit volume disclosure."
+        read = "Confirm next quarter whether favorable mix is structural or transient."
+    else:
+        return _undetermined("Pricing / Volume / Mix", sigs)
 
-    if cat == "Foreign Exchange":
-        if direction == "negative":
-            return f"Foreign currency translation was a headwind{cause_tail}."
-        if direction == "positive":
-            return f"Foreign currency translation provided a tailwind{cause_tail}."
-        return f"Foreign currency translation moved the reported result{cause_tail}."
+    return DriverNote(
+        category="Pricing / Volume / Mix",
+        headline=headline,
+        driver=driver or "Volume / price / mix dynamics described in MD&A.",
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
 
-    if cat == "Tariffs / Trade":
-        if direction == "negative":
-            return f"Tariffs and trade actions weighed on the period{cause_tail}."
-        return f"Tariffs and trade actions are noted as a factor in the period{cause_tail}."
 
-    if cat == "Cost Inflation / Input Costs":
-        if direction == "negative":
-            return f"Higher input costs and inflation pressured margins{cause_tail}."
-        return f"Input cost dynamics influenced the period's margins{cause_tail}."
+def _synth_foreign_exchange(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    pct = _first_pct(text_all)
+    # FX direction inference -- look across all sentences.
+    # NOTE: currency-direction words ("weakened" / "strengthened") describe
+    # the FX rate move, not the P&L impact direction — a weaker USD is a
+    # tailwind for a US reporter, the opposite for a euro reporter. We
+    # only rely on explicit impact-direction language here.
+    is_headwind = any(
+        _UNFAVORABLE_RE.search(s) or _HEADWIND_RE.search(s)
+        or "negative impact" in s.lower() or "reduced" in s.lower()
+        for s in sigs.sentences
+    )
+    is_tailwind = any(
+        _FAVORABLE_RE.search(s) or _TAILWIND_RE.search(s)
+        or "positive impact" in s.lower() or "benefit" in s.lower()
+        for s in sigs.sentences
+    )
+    confidence = _conf_from_signals(sigs, bool(dollar or pct))
+    mag_clause = ""
+    if dollar:
+        mag_clause = f" of approximately {dollar}"
+    elif pct:
+        mag_clause = f" of approximately {pct}"
 
-    if cat == "Restructuring / One-Time":
-        return f"Restructuring or one-time items affected the period's results{cause_tail}."
+    if is_tailwind and not is_headwind:
+        headline = f"Foreign currency translation was a tailwind{mag_clause}."
+        direction = "improved"
+        fi = "Modest positive contribution to reported revenue and / or operating income."
+        read = "Currency exposure is constructive this period — not a structural driver, monitor next quarter."
+    elif is_headwind and not is_tailwind:
+        headline = f"Foreign currency translation was a headwind{mag_clause}."
+        direction = "worsened"
+        fi = "Negative translation impact on reported revenue and / or operating income."
+        read = "Watch dollar trajectory; if FX persists, full-year reported growth will be muted versus organic."
+    elif is_tailwind and is_headwind:
+        headline = "Foreign currency translation effects were mixed across regions."
+        direction = "mixed"
+        fi = "Regional tailwinds and headwinds partially offset at the consolidated level."
+        read = "Net FX impact is muted; focus on organic / constant-currency growth."
+    else:
+        return _undetermined("Foreign Exchange", sigs)
 
-    if cat == "Working Capital":
-        if direction == "negative":
-            return f"Working capital was a use of cash this period{cause_tail}."
-        if direction == "positive":
-            return f"Working capital was a source of cash this period{cause_tail}."
-        return f"Working capital movements affected operating cash flow{cause_tail}."
+    if dollar:
+        driver = f"Currency translation moved the reported number by approximately {dollar}."
+    elif sigs.causes:
+        cause = sigs.causes[0]
+        driver = f"{cause[0].upper()}{cause[1:]}."
+    else:
+        driver = "Currency translation is called out as a factor in MD&A."
 
-    if cat == "Capex / Investment":
-        if direction == "positive":
-            return f"Capex stepped up this period{cause_tail}."
-        if direction == "negative":
-            return f"Capex was lower this period{cause_tail}."
-        return f"Capital investment is highlighted as a factor in the period{cause_tail}."
+    return DriverNote(
+        category="Foreign Exchange",
+        headline=headline,
+        driver=driver,
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
 
-    if cat == "Acquisitions / Divestitures":
-        return f"Portfolio actions (acquisitions / divestitures) shaped the period{cause_tail}."
 
-    if cat == "Segment / Geographic Mix":
-        if direction == "positive":
-            return f"Segment / regional mix was a positive contributor{cause_tail}."
-        if direction == "negative":
-            return f"Segment / regional mix weighed on the period{cause_tail}."
-        return f"Segment / regional mix shaped the period's result{cause_tail}."
+def _synth_cost_inflation(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    low = text_all.lower()
+    dollar = _first_dollar(text_all)
+    pct = _first_pct(text_all)
+    bps = _RE_BPS.search(text_all)
+    mag_clause = ""
+    if bps:
+        mag_clause = f" (~{bps.group(0).strip()})"
+    elif pct:
+        mag_clause = f" (~{pct})"
+    elif dollar:
+        mag_clause = f" (~{dollar})"
 
-    # Generic fallback.
-    return f"{cat} contributed to the period's variance{cause_tail}."
+    is_negative = sigs.neg_hits >= sigs.pos_hits
+    has_mag = bool(dollar or pct or bps)
+    confidence = _conf_from_signals(sigs, has_mag)
+
+    if not is_negative and sigs.pos_hits == 0:
+        return _undetermined("Cost Inflation / Input Costs", sigs)
+
+    headline = f"Higher input costs compressed margins{mag_clause}."
+    direction = "compressed"
+    driver_bits = []
+    if "feedstock" in low or "raw material" in low or "oil" in low:
+        driver_bits.append("higher feedstock / raw material costs")
+    if "freight" in low or "logistics" in low:
+        driver_bits.append("higher freight / logistics")
+    if "energy" in low:
+        driver_bits.append("higher energy")
+    if "labor" in low:
+        driver_bits.append("higher labor")
+    if not driver_bits:
+        driver_bits.append("higher input costs")
+    driver = ", ".join(driver_bits).capitalize()
+    if sigs.causes:
+        driver = f"{driver} — {sigs.causes[0]}"
+
+    fi = "Gross margin compressed; pass-through pricing did not fully recover the input-cost run-up."
+    read = (
+        "Pass-through pricing ability is the structural margin lever. If the "
+        "input-cost spike unwinds, margins should recover; if it sticks, "
+        "watch contractual reset timing."
+    )
+
+    return DriverNote(
+        category="Cost Inflation / Input Costs",
+        headline=headline,
+        driver=driver,
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_working_capital(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    low = text_all.lower()
+    dollar = _first_dollar(text_all)
+
+    has_recv = bool(_SUBJ_RECV.search(low))
+    has_inv = bool(_SUBJ_INV.search(low))
+    has_pay = bool(_SUBJ_PAY.search(low))
+    has_feed = bool(_SUBJ_FEED.search(low))
+
+    # Explicit "use of cash" / "source of cash" wording locks the direction.
+    # Otherwise fall back to inference from sentence-level signals.
+    explicit_use = any(
+        re.search(
+            r"\b(?:use\s+of\s+cash|cash\s+use[ds]?|consumed\s+cash|"
+            r"investment\s+in\s+working\s+capital|build(?:up|-up)?\s+in\s+(?:inventory|receivable))\b",
+            s, re.IGNORECASE,
+        ) for s in sigs.sentences
+    )
+    explicit_source = any(
+        re.search(
+            r"\b(?:source\s+of\s+cash|release(?:d)?\s+(?:working\s+capital|cash)|"
+            r"working\s+capital\s+benefit)\b",
+            s, re.IGNORECASE,
+        ) for s in sigs.sentences
+    )
+    if explicit_use:
+        use_of_cash, source_of_cash = True, False
+    elif explicit_source:
+        use_of_cash, source_of_cash = False, True
+    else:
+        # Inferred — "higher receivable" / "higher inventory" implies a use.
+        higher_uses = any(
+            re.search(r"\bhigher\s+(?:account[s]?\s+)?(?:receivable|inventor)", s, re.IGNORECASE)
+            for s in sigs.sentences
+        )
+        lower_uses = any(
+            re.search(r"\blower\s+(?:account[s]?\s+)?(?:receivable|inventor)", s, re.IGNORECASE)
+            for s in sigs.sentences
+        )
+        use_of_cash = higher_uses or (sigs.neg_hits > sigs.pos_hits and (has_recv or has_inv))
+        source_of_cash = lower_uses or (
+            not has_recv and not has_inv and sigs.pos_hits > sigs.neg_hits
+        )
+
+    confidence = _conf_from_signals(sigs, bool(dollar))
+
+    if use_of_cash and not source_of_cash:
+        mag = f" of approximately {dollar}" if dollar else ""
+        headline = f"Working capital was a cash use this period{mag}."
+        direction = "worsened"
+        bits = []
+        if has_recv:
+            bits.append("higher accounts receivable")
+        if has_inv:
+            bits.append("inventory build")
+        if has_pay:
+            bits.append("timing of payables")
+        if has_feed:
+            bits.append("feedstock / oil-price volatility")
+        if not bits:
+            bits.append("timing of receipts and payments")
+        driver = "Primarily from " + ", ".join(bits) + "."
+        fi = "Contributed to lower operating cash flow versus the prior comparable period."
+        read = (
+            "Watch the receivables build — could indicate slower collections "
+            "or pull-forward shipments. Sustained inventory build is also a "
+            "leading indicator of demand softening."
+        )
+    elif source_of_cash and not use_of_cash:
+        mag = f" of approximately {dollar}" if dollar else ""
+        headline = f"Working capital released cash this period{mag}."
+        direction = "improved"
+        driver = "Receivables collection / inventory drawdown / payables timing were a net positive."
+        fi = "Boosted operating cash flow versus the prior comparable period."
+        read = "Sustainability check: confirm next quarter whether release reverses."
+    else:
+        return _undetermined("Working Capital", sigs)
+
+    return DriverNote(
+        category="Working Capital",
+        headline=headline,
+        driver=driver,
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_segment_geo(sigs: _CategorySignals) -> Optional[DriverNote]:
+    """Segment / Geographic Mix synthesis, with OEC Specialty / Rubber split."""
+    text_all = " | ".join(sigs.sentences)
+    low = text_all.lower()
+
+    specialty_mentioned = bool(_SUBJ_SPECIALTY.search(low))
+    rubber_mentioned = bool(_SUBJ_RUBBER.search(low))
+
+    # When both segments appear in one sentence (typical OEC pattern --
+    # "Specialty grew, while Rubber declined"), split at the conjunction
+    # so each segment's direction is read from its own clause.
+    specialty_dir = "neutral"
+    rubber_dir = "neutral"
+    for s in sigs.sentences:
+        clauses = re.split(r"\bwhile\b|\bbut\b|\bhowever\b|;\s+", s, flags=re.IGNORECASE)
+        for cl in clauses:
+            cl_low = cl.lower()
+            if _SUBJ_SPECIALTY.search(cl_low):
+                d = _direction(cl)
+                if d in ("positive", "negative") and specialty_dir == "neutral":
+                    specialty_dir = d
+            if _SUBJ_RUBBER.search(cl_low):
+                d = _direction(cl)
+                if d in ("positive", "negative") and rubber_dir == "neutral":
+                    rubber_dir = d
+
+    confidence = _conf_from_signals(sigs, False)
+
+    if specialty_mentioned and rubber_mentioned and (
+        specialty_dir != "neutral" or rubber_dir != "neutral"
+    ):
+        # OEC-style split.
+        if specialty_dir == "positive" and rubber_dir == "negative":
+            headline = "Specialty segment outperformed; Rubber segment was the drag."
+            direction = "mixed"
+            driver = (
+                "Specialty Carbon Black demand and / or pricing supported the "
+                "segment, while Rubber Carbon Black volume / pricing weakened."
+            )
+        elif specialty_dir == "negative" and rubber_dir == "positive":
+            headline = "Rubber segment outperformed; Specialty was softer this period."
+            direction = "mixed"
+            driver = "Rubber Carbon Black demand held up, while Specialty Carbon Black softened."
+        elif specialty_dir == "positive" and rubber_dir == "positive":
+            headline = "Both Specialty and Rubber segments contributed positively."
+            direction = "improved"
+            driver = "Specialty and Rubber Carbon Black both saw constructive volume / pricing dynamics."
+        elif specialty_dir == "negative" and rubber_dir == "negative":
+            headline = "Both Specialty and Rubber segments weighed on the period."
+            direction = "worsened"
+            driver = "Specialty and Rubber Carbon Black both showed volume / pricing weakness."
+        else:
+            return _undetermined("Segment / Geographic Mix", sigs)
+        fi = "Segment mix is the primary explanation for the consolidated print."
+        read = (
+            "Mix shift toward higher-margin Specialty is structurally positive; "
+            "Rubber recovery hinges on auto / tire OEM demand and inventory cycle."
+        )
+        return DriverNote(
+            category="Segment / Geographic Mix",
+            headline=headline,
+            driver=driver,
+            financial_impact=fi,
+            investment_read=read,
+            direction=direction,
+            confidence=confidence,
+            excerpts=sigs.sentences[:3],
+        )
+
+    # Generic regional / segment commentary.
+    overall = "positive" if sigs.pos_hits > sigs.neg_hits else (
+        "negative" if sigs.neg_hits > sigs.pos_hits else "neutral"
+    )
+    if overall == "positive":
+        headline = "Segment / regional mix supported the period."
+        direction = "improved"
+        fi = "Mix contribution was a tailwind to consolidated revenue and / or margin."
+    elif overall == "negative":
+        headline = "Segment / regional mix weighed on the period."
+        direction = "worsened"
+        fi = "Mix contribution was a headwind to consolidated revenue and / or margin."
+    else:
+        return _undetermined("Segment / Geographic Mix", sigs)
+    driver = sigs.causes[0] if sigs.causes else "Regional / segment-level performance differed across the portfolio."
+    read = "Look at segment-level disclosure on the next call to confirm whether the mix shift persists."
+    return DriverNote(
+        category="Segment / Geographic Mix",
+        headline=headline,
+        driver=driver,
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_restructuring(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    confidence = _conf_from_signals(sigs, bool(dollar))
+    mag = f" of approximately {dollar}" if dollar else ""
+    headline = f"Restructuring / one-time charges{mag} affected reported results."
+    return DriverNote(
+        category="Restructuring / One-Time",
+        headline=headline,
+        driver=sigs.causes[0] if sigs.causes else "Severance / facility / impairment charges disclosed in the period.",
+        financial_impact="Reported operating income includes a one-time charge; adjusted operating income excludes it.",
+        investment_read="Distinguish underlying run-rate from one-time noise when modelling forward periods.",
+        direction="worsened",
+        confidence=confidence,
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_tariffs(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    pct = _first_pct(text_all)
+    mag = f" (~{dollar})" if dollar else (f" (~{pct})" if pct else "")
+    if sigs.neg_hits >= sigs.pos_hits and (sigs.neg_hits + sigs.pos_hits) >= 1:
+        headline = f"Tariffs / trade actions weighed on the period{mag}."
+        direction = "worsened"
+    elif sigs.pos_hits > sigs.neg_hits:
+        return _undetermined("Tariffs / Trade", sigs)
+    else:
+        return _undetermined("Tariffs / Trade", sigs)
+    fi = "Gross margin impact unless pass-through pricing is achievable."
+    read = "Track quarterly tariff exposure quantification and pricing actions in response."
+    return DriverNote(
+        category="Tariffs / Trade",
+        headline=headline,
+        driver=sigs.causes[0] if sigs.causes else "Specific tariff / trade-action language called out in MD&A.",
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=_conf_from_signals(sigs, bool(dollar or pct)),
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_capex(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    pct = _first_pct(text_all)
+    mag = f" of {dollar}" if dollar else (f" ({pct})" if pct else "")
+    up = sigs.pos_hits > sigs.neg_hits
+    down = sigs.neg_hits > sigs.pos_hits
+    if up:
+        headline = f"Capex stepped up this period{mag}."
+        direction = "increased"
+        fi = "Higher investment temporarily reduces free cash flow."
+    elif down:
+        headline = f"Capex was lower this period{mag}."
+        direction = "decreased"
+        fi = "Lower investment supports near-term free cash flow conversion."
+    else:
+        return _undetermined("Capex / Investment", sigs)
+    read = "Reconcile capex intensity vs the long-term growth / maintenance split disclosed by management."
+    return DriverNote(
+        category="Capex / Investment",
+        headline=headline,
+        driver=sigs.causes[0] if sigs.causes else "Capacity / property / equipment investment called out in the period.",
+        financial_impact=fi,
+        investment_read=read,
+        direction=direction,
+        confidence=_conf_from_signals(sigs, bool(dollar or pct)),
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_acquisitions(sigs: _CategorySignals) -> Optional[DriverNote]:
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    mag = f" (~{dollar})" if dollar else ""
+    return DriverNote(
+        category="Acquisitions / Divestitures",
+        headline=f"Portfolio actions shaped the period{mag}.",
+        driver=sigs.causes[0] if sigs.causes else "Acquisition / divestiture disclosed in MD&A.",
+        financial_impact="Reported numbers reflect M&A contribution; isolate organic growth versus inorganic.",
+        investment_read="Watch organic-only growth and integration commentary on the next call.",
+        direction="mixed",
+        confidence=_conf_from_signals(sigs, bool(dollar)),
+        excerpts=sigs.sentences[:3],
+    )
+
+
+def _synth_generic(category: str, sigs: _CategorySignals) -> Optional[DriverNote]:
+    if sigs.pos_hits == 0 and sigs.neg_hits == 0:
+        return _undetermined(category, sigs)
+    text_all = " | ".join(sigs.sentences)
+    dollar = _first_dollar(text_all)
+    pct = _first_pct(text_all)
+    mag = f" (~{dollar})" if dollar else (f" (~{pct})" if pct else "")
+    up = sigs.pos_hits > sigs.neg_hits
+    headline = (
+        f"{category} contributed positively to the period{mag}." if up
+        else f"{category} weighed on the period{mag}."
+    )
+    direction = "improved" if up else "worsened"
+    return DriverNote(
+        category=category,
+        headline=headline,
+        driver=sigs.causes[0] if sigs.causes else f"{category} called out in MD&A.",
+        financial_impact="Specific financial-statement impact depends on the underlying driver — see source evidence.",
+        investment_read="Confirm structural vs transient and re-rate accordingly.",
+        direction=direction,
+        confidence=_conf_from_signals(sigs, bool(dollar or pct)),
+        excerpts=sigs.sentences[:3],
+    )
+
+
+# Direction regexes used by the volume_change fallback.
+_DIRECTION_UP_RE = re.compile(
+    r"\b(?:increased|grew|rose|expanded|higher|up)\b", re.IGNORECASE
+)
+_DIRECTION_DOWN_RE = re.compile(
+    r"\b(?:decreased|declined|fell|lower|down|contracted|weaker)\b",
+    re.IGNORECASE,
+)
+
+
+_SYNTHESIZERS: dict[str, callable] = {
+    "Pricing / Volume / Mix": _synth_pricing_volume_mix,
+    "Foreign Exchange": _synth_foreign_exchange,
+    "Tariffs / Trade": _synth_tariffs,
+    "Cost Inflation / Input Costs": _synth_cost_inflation,
+    "Restructuring / One-Time": _synth_restructuring,
+    "Working Capital": _synth_working_capital,
+    "Capex / Investment": _synth_capex,
+    "Acquisitions / Divestitures": _synth_acquisitions,
+    "Segment / Geographic Mix": _synth_segment_geo,
+}
+
+
+def extract_drivers(paragraphs, *, max_per_category: int = 1) -> list[DriverNote]:
+    """Produce one structured driver card per detected category.
+
+    Cards are merged at synthesis time -- there is at most one card per
+    category, not one per sentence. Each card carries:
+
+      - ``headline``: one sentence with direction and magnitude
+      - ``driver`` / ``financial_impact`` / ``investment_read``: bullet
+        bodies the UI renders directly
+      - ``confidence``: "high" | "medium" | "low"
+      - ``excerpts``: raw source sentences for the evidence expander
+
+    If the direction can't be determined for a category that has source
+    evidence, an honest "direction not clearly detected" card is emitted
+    rather than a vague generic one.
+    """
+    signals = _collect_signals(paragraphs)
+    out: list[DriverNote] = []
+    seen_cats: set[str] = set()
+    for label, _ in DRIVER_CATEGORIES:
+        sigs = signals.get(label)
+        if not sigs or not sigs.sentences:
+            continue
+        synth = _SYNTHESIZERS.get(label)
+        card = synth(sigs) if synth else _synth_generic(label, sigs)
+        if card and label not in seen_cats:
+            out.append(card)
+            seen_cats.add(label)
+    other = signals.get("Other")
+    if other and other.sentences and "Other" not in seen_cats:
+        card = _synth_generic("Other", other)
+        if card:
+            out.append(card)
+    return out
 
 
 def _is_real_guidance(sent: str) -> bool:

@@ -177,12 +177,30 @@ st.markdown(
       }
       .fd-driver {
         border-left:3px solid #2563EB; background:#EFF6FF;
-        padding:8px 12px; border-radius:6px; margin-bottom:8px;
+        padding:10px 14px; border-radius:6px; margin-bottom:10px;
       }
       .fd-driver-cat {
         font-weight:600; color:#1E3A8A; font-size:0.85rem;
-        margin-bottom:4px;
+        margin-bottom:4px; display:flex; justify-content:space-between;
+        align-items:baseline;
       }
+      .fd-driver-conf {
+        font-weight:500; font-size:0.74rem; padding:2px 8px;
+        border-radius:999px; white-space:nowrap;
+      }
+      .fd-driver-conf-high   { color:#065F46; background:#D1FAE5; }
+      .fd-driver-conf-medium { color:#92400E; background:#FEF3C7; }
+      .fd-driver-conf-low    { color:#374151; background:#E5E7EB; }
+      .fd-driver-headline {
+        color:#111827; font-size:0.95rem; font-weight:600;
+        margin:4px 0 6px 0;
+      }
+      .fd-driver-bullets {
+        margin:4px 0 0 0; padding-left:18px;
+        color:#374151; font-size:0.88rem;
+      }
+      .fd-driver-bullets li { margin-bottom:3px; }
+      .fd-driver-bullets li strong { color:#1E3A8A; }
       .fd-guidance {
         border-left:3px solid #059669; background:#ECFDF5;
         padding:8px 12px; border-radius:6px; margin-bottom:8px;
@@ -439,32 +457,57 @@ def _render_topic_card(card: TopicCard) -> None:
 
 
 def _render_drivers(drivers: list[DriverNote]) -> None:
-    """Render Business Drivers as polished analyst bullets.
+    """Render Business Drivers as structured analyst cards.
 
-    The default view shows the analyst-voice ``headline``; raw filing
-    text lives in a single "Show evidence" expander underneath the
-    bullets.
+    Each card carries: category label, one-sentence directional headline,
+    Driver / Financial impact / Investment read bullets, and a confidence
+    chip. Raw filing text lives only inside the "Source evidence"
+    expander.
     """
     if not drivers:
         st.write(
             "_No explicit business-driver language detected in the filing._"
         )
         return
-    for d in drivers[:8]:
+
+    conf_labels = {
+        "high": "High confidence",
+        "medium": "Medium confidence",
+        "low": "Low confidence",
+    }
+
+    for d in drivers:
+        conf_cls = f"fd-driver-conf-{d.confidence}" if d.confidence in conf_labels else "fd-driver-conf-low"
+        conf_text = conf_labels.get(d.confidence, "")
+        bullets: list[str] = []
+        if d.driver:
+            bullets.append(f"<li><strong>Driver:</strong> {d.driver}</li>")
+        if d.financial_impact:
+            bullets.append(f"<li><strong>Financial impact:</strong> {d.financial_impact}</li>")
+        if d.investment_read:
+            bullets.append(f"<li><strong>Investment read:</strong> {d.investment_read}</li>")
+        bullets_html = "".join(bullets)
         st.markdown(
             f"""
             <div class="fd-driver">
-              <div class="fd-driver-cat">{d.category}</div>
-              <div>{d.headline or d.excerpt}</div>
+              <div class="fd-driver-cat">
+                <span>{d.category}</span>
+                <span class="fd-driver-conf {conf_cls}">{conf_text}</span>
+              </div>
+              <div class="fd-driver-headline">{d.headline}</div>
+              {f'<ul class="fd-driver-bullets">{bullets_html}</ul>' if bullets_html else ''}
             </div>
             """,
             unsafe_allow_html=True,
         )
-    with st.expander("Show evidence", expanded=False):
-        for d in drivers[:8]:
-            st.markdown(
-                f"**{d.category}** — \"{d.excerpt}\""
-            )
+    if any(d.excerpts for d in drivers):
+        with st.expander("Source evidence", expanded=False):
+            for d in drivers:
+                if not d.excerpts:
+                    continue
+                st.markdown(f"**{d.category}**")
+                for ex in d.excerpts:
+                    st.markdown(f"> \"{ex}\"")
 
 
 def _render_guidance(notes: list[GuidanceNote]) -> None:

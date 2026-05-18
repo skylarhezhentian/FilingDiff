@@ -1,6 +1,6 @@
 # FilingDiff
 
-A polished SEC filing insight Streamlit app for public equity research.
+This is a SEC filing insight Streamlit app for public equity research.
 
 Enter a ticker. The app fetches the company's filing history, the SEC
 XBRL companyfacts API, and the latest filing's HTML, then renders an

@@ -143,6 +143,23 @@ RED_FLAG_PHRASES = [
 
 
 @dataclass
+class TopicEvidence:
+    """Specific evidence supporting a risk-severe topic's sentiment.
+
+    Built only for Risk Factors / Legal Proceedings / Controls and
+    Procedures topics. If the topic is labeled Negative but no specific
+    evidence can be collected, the card is downgraded to Neutral so the
+    UI does not contradict the "no severe red flags" message.
+    """
+
+    what_changed: str  # one-line summary of the specific change
+    why_negative: str  # why this is cautionary (not generic language)
+    evidence_type: str  # "event" | "cautionary" | "boilerplate" | "insufficient"
+    confidence: str  # "high" | "medium" | "low"
+    excerpt: str  # raw filing quote
+
+
+@dataclass
 class TopicCard:
     """One topic-level sentiment card.
 
@@ -151,6 +168,12 @@ class TopicCard:
     ``narrative`` field carries the rendered 3-5 sentence interpretation
     and ``numbers`` carries the headline numeric lines for the card.
     No mechanical "N supporting changes" wording is exposed here.
+
+    For Risk Factors / Legal Proceedings / Controls and Procedures,
+    ``evidence`` carries a specific What-changed / Why-negative breakdown.
+    If we cannot point to specific evidence for a Negative sentiment on
+    one of these topics, the sentiment is *downgraded* to Neutral and
+    ``downgraded_from`` records the original label.
     """
 
     topic: str
@@ -160,6 +183,8 @@ class TopicCard:
     why_it_matters: str
     # Kept internally for *sorting* only; never rendered.
     evidence_count: int = 0
+    evidence: Optional[TopicEvidence] = None
+    downgraded_from: Optional[str] = None
 
 
 @dataclass
@@ -185,20 +210,32 @@ class WatchItem:
     """A watchlist phrase + its classification.
 
     classification is one of:
-      - "true"        : phrase is asserted as present (true red flag)
-      - "negated"     : phrase is mentioned but explicitly negated (e.g.
-                        "Defaults Upon Senior Securities: None")
-      - "boilerplate" : recurring SEC disclosure that always reads as
-                        a non-finding (typically a header followed by
-                        "None" / "Not applicable")
-      - "resolved"    : phrase was present in the prior filing and is
-                        now removed from changed text (suggests the
-                        prior-period risk has dropped out of disclosure)
-    Only "true" classifications are shown prominently by the UI.
+      - "true"        : phrase is asserted as a new event in a *changed*
+                        paragraph with no negation or definition context
+                        (true red flag for this filing).
+      - "ongoing"     : phrase appears in the latest filing text but
+                        not in any changed paragraph -- a known issue
+                        that persists from prior disclosure. Surfaced
+                        prominently alongside "true" findings.
+      - "negated"     : phrase is present but explicitly negated (e.g.
+                        "Defaults Upon Senior Securities: None").
+      - "boilerplate" : phrase appears inside a definition, a "None"
+                        header, an adjusted-EBITDA reconciliation, or
+                        another non-event context.
+      - "resolved"    : phrase was present in the prior filing and has
+                        been removed (the change_type is "Deleted").
+      - "weak"        : phrase has the keyword but the surrounding
+                        context does not confirm an actual event. Used
+                        for ambiguous phrases like "default" /
+                        "termination" / "restructuring" / "impairment"
+                        when no event-confirming verb is present.
+
+    The UI shows "true" and "ongoing" prominently; the others sit in a
+    collapsed expander.
     """
 
     phrase: str
-    classification: str  # "true" | "negated" | "boilerplate" | "resolved"
+    classification: str  # see docstring above
     section: str
     excerpt: str
     why_it_matters: str
@@ -341,15 +378,111 @@ def _is_negated(text: str, phrase: str) -> tuple[bool, bool]:
     win_low = window.lower()
     for pat in _NEGATION_PATTERNS:
         if re.search(pat, window, flags=re.IGNORECASE):
-            # Boilerplate is a negated phrase that is also one of the
-            # known recurring headers like "Off-balance Sheet" / "None".
-            is_boilerplate = phrase in _BOILERPLATE_HEADERS or (
-                # "Defaults Upon Senior Securities: None" pattern.
-                re.search(r"\b(?:defaults?|controls?|legal\s+proceedings?|securities)\b", win_low)
-                and "none" in win_low
-            )
+            # Boilerplate-header treatment is reserved for phrases like
+            # "off-balance sheet" that appear in SEC's recurring "None /
+            # Not Applicable" disclosure sections. A simple "Defaults
+            # Upon Senior Securities: None" line is classified as
+            # NEGATED -- the filing affirmatively answered the question
+            # with "None". Definition / hypothetical contexts are
+            # handled separately by _is_definition_context.
+            is_boilerplate = phrase in _BOILERPLATE_HEADERS
             return True, bool(is_boilerplate)
     return False, False
+
+
+# ---------------------------------------------------------------------------
+# Definition / hypothetical / weak-evidence detectors
+# ---------------------------------------------------------------------------
+
+# Phrases that, when present in the *window* around the flag phrase,
+# mean the flag is appearing inside a definition or a hypothetical
+# clause rather than describing an actual event.
+_DEFINITION_CUES_RE = re.compile(
+    r"\b(?:defined\s+as|is\s+defined|consists?\s+of|includes?\s+(?:items|charges|costs|expenses)|"
+    r"excluding|excludes?|such\s+as|including\s+(?:but\s+not\s+limited\s+to)?|"
+    r"means\s+(?:net\s+income|operating\s+income|earnings)|"
+    r"non-?gaap\s+(?:measure|financial)|reconciliation\s+(?:of|to)|"
+    r"adjusted\s+ebitda|adjusted\s+net\s+income|adjusted\s+operating\s+income)\b",
+    re.IGNORECASE,
+)
+
+# Hypothetical / contractual conditional cues: "in the event of a
+# default", "upon termination of the agreement", etc.
+_HYPOTHETICAL_CUES_RE = re.compile(
+    r"\b(?:in\s+the\s+event\s+of|upon\s+(?:a\s+)?(?:default|termination|breach|change\s+of\s+control)|"
+    r"could\s+result\s+in|may\s+result\s+in|would\s+(?:constitute|result|trigger)|"
+    r"any\s+such\s+(?:default|termination|breach))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_definition_context(text: str, phrase: str) -> bool:
+    """True iff the phrase appears inside a definition or hypothetical."""
+    low = text.lower()
+    idx = low.find(phrase)
+    if idx < 0:
+        return False
+    # Wider window than negation because definitional language can run
+    # for a few sentences.
+    window = text[max(0, idx - 200) : idx + len(phrase) + 80]
+    if _DEFINITION_CUES_RE.search(window) or _HYPOTHETICAL_CUES_RE.search(window):
+        return True
+    return False
+
+
+# Watchlist phrases whose default classification is "weak" -- they
+# require an event-confirming context phrase in the surrounding text to
+# upgrade to a true / ongoing finding.
+_WEAK_PHRASES = {
+    "default",
+    "termination",
+    "restructuring",
+    "impairment",
+    "investigation",
+}
+
+# Per-phrase event-confirming regexes. Match these and the phrase is
+# treated as a real event; miss them and we mark it "weak".
+_EVENT_CONTEXT_RES: dict[str, re.Pattern] = {
+    "default": re.compile(
+        r"\b(?:notice\s+of\s+default|we\s+defaulted|company\s+defaulted|"
+        r"defaulted\s+on|declared\s+(?:a\s+)?default|currently\s+in\s+default|"
+        r"event\s+of\s+default\s+has\s+occurred|cured\s+the\s+default)\b",
+        re.IGNORECASE,
+    ),
+    "termination": re.compile(
+        r"\b(?:terminated\s+(?:the\s+)?(?:contract|agreement|employment|relationship|customer)|"
+        r"received\s+(?:a\s+)?termination\s+notice|termination\s+notice|"
+        r"notice\s+of\s+termination|severance\s+(?:payment|charge)\s+of|"
+        r"terminated\s+(?:our\s+|its\s+)?(?:ceo|chief\s+executive|cfo))\b",
+        re.IGNORECASE,
+    ),
+    "restructuring": re.compile(
+        r"\b(?:restructuring\s+(?:plan|charge|program|initiative|action|cost|expense)\s+of\s+\$|"
+        r"announced\s+(?:a\s+)?restructuring|restructuring\s+charges?\s+of\s+(?:approximately\s+)?\$|"
+        r"incurred\s+restructuring|workforce\s+reduction\s+of|facility\s+closure\s+(?:in|of))\b",
+        re.IGNORECASE,
+    ),
+    "impairment": re.compile(
+        r"\b(?:recorded\s+(?:an\s+)?impairment|impairment\s+(?:charge|loss)\s+of\s+\$|"
+        r"goodwill\s+impairment\s+of|asset\s+impairment\s+of|impaired\s+the)\b",
+        re.IGNORECASE,
+    ),
+    "investigation": re.compile(
+        r"\b(?:sec\s+investigation|doj\s+investigation|government\s+investigation|"
+        r"under\s+investigation\s+by|formal\s+investigation|received\s+(?:a\s+)?subpoena|"
+        r"civil\s+investigative\s+demand|opened\s+an\s+investigation)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def _has_event_context(text: str, phrase: str) -> bool:
+    """True if the watchlist phrase has supporting event-confirming context."""
+    pat = _EVENT_CONTEXT_RES.get(phrase)
+    if pat is None:
+        return True  # Phrases not in WEAK_PHRASES default to confirmed.
+    return bool(pat.search(text))
 
 
 _RED_FLAG_WHY: dict[str, str] = {
@@ -372,21 +505,62 @@ _RED_FLAG_WHY: dict[str, str] = {
 }
 
 
+def _classify_one(
+    text: str,
+    phrase: str,
+    *,
+    change_type: Optional[str],
+) -> str:
+    """Pure classifier: text + phrase -> one of the six classifications.
+
+    Precedence:
+      1. Deleted paragraph + not negated -> resolved
+      2. Definition / hypothetical context -> boilerplate
+      3. Explicit None / Not-Applicable boilerplate header -> boilerplate
+      4. Other negation -> negated
+      5. Weak phrase (default / termination / restructuring / ...) with
+         no event-confirming context -> weak
+      6. Else: true if found in a change, ongoing if Stage 2.
+    """
+    negated, boilerplate_header = _is_negated(text, phrase)
+    if change_type == "Deleted" and not negated:
+        return "resolved"
+    # Definition / hypothetical context wins over a bare "true" reading.
+    if _is_definition_context(text, phrase):
+        return "boilerplate"
+    if boilerplate_header:
+        return "boilerplate"
+    if negated:
+        return "negated"
+    # Weak-phrase gate: phrases like "default" / "termination" /
+    # "restructuring" / "impairment" need an event-confirming clause
+    # nearby. Without it we mark them "weak" so they don't pollute the
+    # primary findings list.
+    if phrase in _WEAK_PHRASES and not _has_event_context(text, phrase):
+        return "weak"
+    # Stage 2 (no change_type) means we found the phrase in the latest
+    # filing but it didn't surface as a change. Treat as "ongoing".
+    if change_type is None:
+        return "ongoing"
+    return "true"
+
+
 def classify_watch_items(
     changes: Iterable[ParagraphChange],
     latest_paragraphs: list,
 ) -> list[WatchItem]:
-    """Classify each watchlist phrase as True / Negated / Boilerplate / Resolved.
+    """Classify each watchlist phrase across two passes.
 
-    Two-stage scan:
-      - Stage 1: walk changed paragraphs. If a phrase appears in a New /
-        Big-Change paragraph and is *not* negated, classify as True.
-        If it appears in a Deleted paragraph, classify as Resolved.
-        Negated => Negated / Boilerplate.
-      - Stage 2: scan latest filing text for any phrases still
-        unaccounted for. Classify as True / Negated / Boilerplate.
+    Pass 1 walks the paragraph-level changes. Any phrase found there is
+    classified using the change_type (so a deleted-paragraph hit becomes
+    "resolved", an event-confirmed new-paragraph hit becomes "true").
 
-    Phrases not found anywhere are omitted (no "Not Found" noise).
+    Pass 2 scans the full latest filing text for phrases that did not
+    surface in any change. These get classified with no change_type --
+    typically resulting in "ongoing" if the surrounding context confirms
+    the event, or "weak" / "negated" / "boilerplate" otherwise.
+
+    Phrases that don't appear anywhere are omitted entirely.
     """
     items: list[WatchItem] = []
     classified: set[str] = set()
@@ -394,6 +568,7 @@ def classify_watch_items(
         (p.text if hasattr(p, "text") else str(p)) for p in latest_paragraphs
     )
 
+    # Pass 1 -- look at changed paragraphs.
     for ch in changes:
         text = ch.display_text
         low = text.lower()
@@ -402,15 +577,7 @@ def classify_watch_items(
                 continue
             if phrase not in low:
                 continue
-            negated, boilerplate = _is_negated(text, phrase)
-            if ch.change_type == "Deleted" and not negated:
-                cls = "resolved"
-            elif boilerplate:
-                cls = "boilerplate"
-            elif negated:
-                cls = "negated"
-            else:
-                cls = "true"
+            cls = _classify_one(text, phrase, change_type=ch.change_type)
             items.append(
                 WatchItem(
                     phrase=phrase,
@@ -423,36 +590,35 @@ def classify_watch_items(
             )
             classified.add(phrase)
 
-    # Stage 2: anything not yet classified, scan the full latest filing.
+    # Pass 2 -- scan the latest filing for any phrases not yet classified.
     for phrase in RED_FLAG_PHRASES:
         if phrase in classified:
             continue
         if phrase not in latest_text_blob.lower():
             continue
-        negated, boilerplate = _is_negated(latest_text_blob, phrase)
-        if boilerplate:
-            cls = "boilerplate"
-        elif negated:
-            cls = "negated"
-        else:
-            cls = "true"
-        # Extract a small excerpt around the first hit.
+        # For the excerpt, lift a small window around the first hit so
+        # the classifier sees enough context to apply definition /
+        # event-context heuristics.
         idx = latest_text_blob.lower().find(phrase)
-        ex = latest_text_blob[max(0, idx - 80) : idx + 200]
+        ex_window = latest_text_blob[max(0, idx - 200) : idx + 240]
+        cls = _classify_one(ex_window, phrase, change_type=None)
         items.append(
             WatchItem(
                 phrase=phrase,
                 classification=cls,
                 section="—",
-                excerpt=_clip(ex, 360),
+                excerpt=_clip(ex_window, 360),
                 why_it_matters=_RED_FLAG_WHY.get(phrase, "Watchlist item."),
                 change_type=None,
             )
         )
         classified.add(phrase)
 
-    # Order: true > resolved > negated > boilerplate.
-    order = {"true": 0, "resolved": 1, "negated": 2, "boilerplate": 3}
+    # Order: true > ongoing > resolved > negated > boilerplate > weak.
+    order = {
+        "true": 0, "ongoing": 1, "resolved": 2,
+        "negated": 3, "boilerplate": 4, "weak": 5,
+    }
     items.sort(key=lambda w: order.get(w.classification, 9))
     return items
 
@@ -525,6 +691,101 @@ def filter_changes_by_topics(
 # ---------------------------------------------------------------------------
 
 
+RISK_SEVERE_TOPICS = {
+    "Risk Factors",
+    "Legal Proceedings",
+    "Controls and Procedures",
+}
+
+
+def _summarize_change(ch: ParagraphChange) -> str:
+    """One-line summary of what changed in a paragraph (for risk evidence)."""
+    ct = ch.change_type
+    section = ch.section or "this section"
+    if ct == "New":
+        return f"Filing adds new disclosure language under {section}."
+    if ct == "Deleted":
+        return f"Filing removes prior disclosure language under {section}."
+    if ct == "Big Change":
+        return f"Filing materially rewrites disclosure language under {section}."
+    if ct in ("Medium Change", "Small Change"):
+        return f"Filing modifies disclosure language under {section}."
+    return f"Disclosure change under {section}."
+
+
+# Map each risk-severe topic to the watchlist phrases that, if surfaced
+# as a "true" or "ongoing" hit, count as event evidence for the topic.
+_TOPIC_TO_FLAG_PHRASES = {
+    "Controls and Procedures": ["material weakness", "going concern", "substantial doubt"],
+    "Legal Proceedings": ["subpoena", "investigation", "covenant breach"],
+    "Risk Factors": [],  # Risk Factors has no canonical phrase set.
+}
+
+
+def _build_risk_topic_evidence(
+    topic: str,
+    items: list[RankedChange],
+    watch_items: list,
+) -> Optional[TopicEvidence]:
+    """Build specific evidence supporting a Negative sentiment on a risk topic.
+
+    Returns None when no specific evidence is available -- the caller
+    then downgrades the topic to Neutral rather than emitting a vague
+    "language tightened" card.
+    """
+    # 1) Event evidence: any true / ongoing watch-item phrases tied to
+    # this topic count as the strongest signal.
+    flag_phrases = _TOPIC_TO_FLAG_PHRASES.get(topic, [])
+    if flag_phrases:
+        for w in watch_items:
+            if w.classification not in ("true", "ongoing"):
+                continue
+            if w.phrase not in flag_phrases:
+                continue
+            return TopicEvidence(
+                what_changed=(
+                    f"Filing surfaces {w.phrase} "
+                    f"({'new this period' if w.classification == 'true' else 'ongoing from prior disclosure'})."
+                ),
+                why_negative=w.why_it_matters,
+                evidence_type="event",
+                confidence="high",
+                excerpt=w.excerpt,
+            )
+
+    # 2) Cautionary-language evidence: a New / Big-Change paragraph for
+    # this topic with substantive negative polarity language. We require
+    # >=2 polarity hits with neg > pos for the change to count; smaller
+    # diffs are too noisy.
+    candidates: list[tuple[RankedChange, int]] = []
+    for r in items:
+        ch = r.change
+        if ch.change_type not in ("New", "Big Change"):
+            continue
+        if len(ch.display_text) < 80:
+            continue
+        pos, neg = _polarity(ch.display_text)
+        if neg >= 2 and neg > pos:
+            candidates.append((r, neg - pos))
+    candidates.sort(key=lambda x: -x[1])
+    if candidates:
+        r, score = candidates[0]
+        confidence = "medium" if score >= 3 else "low"
+        return TopicEvidence(
+            what_changed=_summarize_change(r.change),
+            why_negative=(
+                "The new / rewritten paragraph carries multiple cautionary "
+                "polarity terms without offsetting positives."
+            ),
+            evidence_type="cautionary",
+            confidence=confidence,
+            excerpt=_clip(r.change.display_text, 360),
+        )
+
+    # No specific evidence -> caller should downgrade.
+    return None
+
+
 def build_topic_cards(
     ranked: list[RankedChange],
     latest_paragraphs: list,
@@ -532,19 +793,24 @@ def build_topic_cards(
     income_metrics: list,
     cashflow_metrics: list,
     balance_metrics: list,
+    watch_items: Optional[list] = None,
 ) -> list[TopicCard]:
     """Build topic sentiment cards combining sentiment + XBRL numbers + driver quote.
 
-    No mechanical "N supporting changes" wording leaks into the rendered
-    card. The polarity signal is derived from the changed paragraphs as
-    before; the rest of the card pulls in real numbers and a quoted
-    driver sentence so the narrative actually carries content.
+    For Risk Factors / Legal Proceedings / Controls and Procedures we
+    additionally try to attach a ``TopicEvidence`` block. If the
+    sentiment came up Negative / Slightly Negative but we cannot point
+    to a specific change or event, we downgrade the card to Neutral and
+    record the original label in ``downgraded_from`` so the UI can say
+    so honestly.
     """
     # Locally import to keep the module decoupled at top-level.
     from narrative import (
         TOPIC_WHY, topic_narrative, topic_numbers,
         CAUSAL_PHRASES, _find_sentence_with,
     )
+
+    watch_items = watch_items or []
 
     by_topic: dict[str, list[RankedChange]] = defaultdict(list)
     for r in ranked:
@@ -560,9 +826,33 @@ def build_topic_cards(
             neg_total += n
         sentiment = _label_polarity(pos_total, neg_total)
 
+        # Risk-severe topics: collect specific evidence; downgrade if none.
+        evidence: Optional[TopicEvidence] = None
+        downgraded_from: Optional[str] = None
+        if topic in RISK_SEVERE_TOPICS:
+            if sentiment in ("Negative", "Slightly Negative"):
+                evidence = _build_risk_topic_evidence(topic, items, watch_items)
+                if evidence is None:
+                    downgraded_from = sentiment
+                    sentiment = "Neutral"
+            elif sentiment == "Mixed":
+                evidence = _build_risk_topic_evidence(topic, items, watch_items)
+
         numbers = topic_numbers(topic, income_metrics, cashflow_metrics, balance_metrics)
         driver_quote = _topic_driver_quote(topic, latest_paragraphs, CAUSAL_PHRASES, _find_sentence_with)
         narrative = topic_narrative(topic, sentiment, numbers, driver_quote)
+        # For risk-severe topics, override the generic narrative with
+        # the evidence-driven version (or an honest "no material new
+        # language" fallback when downgraded).
+        if topic in RISK_SEVERE_TOPICS:
+            if downgraded_from:
+                narrative = (
+                    f"{topic}: Neutral — no material new "
+                    f"{topic.lower()} language detected versus the prior "
+                    f"comparable filing."
+                )
+            elif evidence:
+                narrative = f"{evidence.what_changed} {evidence.why_negative}"
         why = TOPIC_WHY.get(topic, "")
 
         cards.append(
@@ -573,6 +863,8 @@ def build_topic_cards(
                 numbers=numbers,
                 why_it_matters=why,
                 evidence_count=len(items),
+                evidence=evidence,
+                downgraded_from=downgraded_from,
             )
         )
 
@@ -919,6 +1211,7 @@ def build_report(
         income_metrics=income_metrics,
         cashflow_metrics=cashflow_metrics,
         balance_metrics=balance_metrics,
+        watch_items=watch_items,
     )
     key_topics = _top_topics(ranked, k=6) or [c.topic for c in cards[:6]]
     return ReportBundle(

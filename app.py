@@ -57,6 +57,7 @@ from analysis import (
     RedFlagHit,
     ReportBundle,
     TopicCard,
+    TopicEvidence,
     WatchItem,
     build_report,
     filter_changes_by_topics,
@@ -84,6 +85,12 @@ from narrative import (
     extract_fallback_segments,
     extract_guidance,
     segment_commentary,
+)
+from eightk import (
+    EightKEvent,
+    Highlight,
+    KeyMetric,
+    extract_8k_event,
 )
 from redline import redline_html, added_html, deleted_html
 
@@ -213,6 +220,46 @@ st.markdown(
         background:#F9FAFB; border-radius:6px; padding:6px 10px;
         margin-top:4px; font-size:0.88rem; color:#374151;
       }
+      .fd-8k-header {
+        background:#F0F9FF; border:1px solid #BAE6FD;
+        border-radius:6px; padding:12px 14px; margin-bottom:10px;
+      }
+      .fd-8k-event-type {
+        font-weight:700; color:#075985; font-size:1.05rem;
+      }
+      .fd-8k-meta {
+        display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;
+      }
+      .fd-8k-chip {
+        background:#E0F2FE; color:#075985; font-size:0.78rem;
+        padding:3px 9px; border-radius:999px; white-space:nowrap;
+      }
+      .fd-8k-mat-high   { background:#FECACA; color:#7F1D1D; }
+      .fd-8k-mat-medium { background:#FEF3C7; color:#92400E; }
+      .fd-8k-mat-low    { background:#E5E7EB; color:#374151; }
+      .fd-8k-metric {
+        background:#FFFFFF; border:1px solid #E5E7EB;
+        border-radius:6px; padding:8px 12px; margin-bottom:6px;
+      }
+      .fd-8k-metric-label {
+        font-size:0.78rem; color:#6B7280; text-transform:uppercase;
+        letter-spacing:0.05em;
+      }
+      .fd-8k-metric-value {
+        font-size:1.1rem; font-weight:600; color:#111827;
+        margin-top:2px;
+      }
+      .fd-8k-metric-delta {
+        font-size:0.85rem; color:#6B7280; margin-left:6px;
+      }
+      .fd-8k-highlight {
+        border-left:3px solid #0EA5E9; background:#F0F9FF;
+        padding:8px 12px; border-radius:6px; margin-bottom:8px;
+      }
+      .fd-8k-highlight-title {
+        font-weight:600; color:#075985; font-size:0.88rem;
+        margin-bottom:3px;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -254,6 +301,48 @@ def cached_filing(
     )
     paras, html = extract_filing(f)
     return [{"text": p.text, "section": p.section} for p in paras], html
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def cached_filing_documents(cik: str, accession_no: str) -> list[dict]:
+    """List every file inside a filing's accession folder, with SEC type label."""
+    from edgar import get_filing_documents
+    docs = get_filing_documents(cik, accession_no)
+    return [
+        {"name": d.name, "doc_type": d.doc_type, "url": d.url}
+        for d in docs
+    ]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def cached_exhibit_paragraphs(url: str) -> tuple[list[dict], int]:
+    """Fetch and parse one exhibit document into (paragraph_dicts, char_count).
+
+    Uses the press-release extractor (table-preserving, bullet-aware)
+    because most 8-K exhibits are earnings releases or marketing-style
+    business updates whose data lives in compact inline tables and
+    bullet lists rather than long prose paragraphs.
+
+    Returns ([], 0) on any fetch / parse error so the caller can surface
+    a "could not be parsed" status without crashing the tab.
+    """
+    from edgar import http_get
+    from extract import html_to_press_release_text
+    try:
+        resp = http_get(url)
+        html = resp.text
+    except Exception:  # noqa: BLE001
+        return [], 0
+    if not html:
+        return [], 0
+    try:
+        paras = html_to_press_release_text(html)
+    except Exception:  # noqa: BLE001
+        return [], len(html)
+    return (
+        [{"text": p.text, "section": p.section} for p in paras],
+        len(html),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,23 +432,51 @@ def _render_breakdown_table(rows: list[BreakdownRow], title: str) -> None:
             "use a non-standard label set; try opening the SEC document directly._"
         )
         return
-    html = [f'<table class="fd-table"><thead><tr>',
-            f'<th>{title}</th><th>Latest</th><th>Prior</th><th>YoY</th></tr></thead><tbody>']
-    for r in rows:
-        if r.delta_pct is None:
-            delta_cell = "—"
-            cls = ""
-        else:
-            delta_cell = f"{r.delta_pct:+.1f}%"
-            cls = "delta-up" if r.delta_pct >= 0 else "delta-down"
-        html.append(
-            f"<tr><td>{r.label}</td>"
-            f"<td>{r.latest_str or '—'}</td>"
-            f"<td>{r.prior_str or '—'}</td>"
-            f'<td class="{cls}">{delta_cell}</td></tr>'
+
+    # Confidence gate: if more than half the rows have no parsed prior,
+    # we render the latest column only and surface a caveat. This is the
+    # conservative path -- better to say "not confidently parsed" than
+    # to compute YoY from mis-paired cells.
+    from tables import breakdown_has_confident_prior  # local to avoid cycle
+    confident = breakdown_has_confident_prior(rows)
+
+    if confident:
+        html = [
+            f'<table class="fd-table"><thead><tr>'
+            f'<th>{title}</th><th>Latest</th><th>Prior</th><th>YoY</th></tr></thead><tbody>'
+        ]
+        for r in rows:
+            if r.delta_pct is None:
+                delta_cell = "—"
+                cls = ""
+            else:
+                delta_cell = f"{r.delta_pct:+.1f}%"
+                cls = "delta-up" if r.delta_pct >= 0 else "delta-down"
+            html.append(
+                f"<tr><td>{r.label}</td>"
+                f"<td>{r.latest_str or '—'}</td>"
+                f"<td>{r.prior_str or '—'}</td>"
+                f'<td class="{cls}">{delta_cell}</td></tr>'
+            )
+        html.append("</tbody></table>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+    else:
+        html = [
+            f'<table class="fd-table"><thead><tr>'
+            f'<th>{title}</th><th>Latest</th></tr></thead><tbody>'
+        ]
+        for r in rows:
+            html.append(
+                f"<tr><td>{r.label}</td>"
+                f"<td>{r.latest_str or '—'}</td></tr>"
+            )
+        html.append("</tbody></table>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+        st.caption(
+            "Prior-period values were not confidently parsed for this "
+            "table — YoY suppressed to avoid mispaired comparisons. See "
+            "the source filing for the as-disclosed comparatives."
         )
-    html.append("</tbody></table>")
-    st.markdown("".join(html), unsafe_allow_html=True)
 
 
 def _render_evidence(ranked: list[RankedChange], wanted_topics: set[str]) -> None:
@@ -454,6 +571,75 @@ def _render_topic_card(card: TopicCard) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_cautionary_topic_card(card: TopicCard) -> None:
+    """Render a risk-severe topic card with evidence breakdown.
+
+    Used for Risk Factors / Legal Proceedings / Controls and
+    Procedures. Shows What changed / Why negative / Evidence type /
+    Confidence so a negative label is never unexplained. Cards that
+    were downgraded from Negative to Neutral due to insufficient
+    evidence render with an honest "no material new ... language
+    detected" line.
+    """
+    cls = {
+        "Positive": "fd-positive",
+        "Slightly Positive": "fd-slightly-positive",
+        "Neutral": "fd-neutral",
+        "Mixed": "fd-mixed",
+        "Slightly Negative": "fd-slightly-negative",
+        "Negative": "fd-negative",
+    }.get(card.sentiment, "fd-neutral")
+
+    # Build the evidence block (if any).
+    evidence_html = ""
+    if card.downgraded_from:
+        evidence_html = (
+            '<ul class="fd-driver-bullets">'
+            f'<li><strong>Status:</strong> downgraded from {card.downgraded_from}; '
+            f"no specific change found.</li>"
+            '<li><strong>Confidence:</strong> low (no event or material '
+            "language change to anchor the label).</li>"
+            "</ul>"
+        )
+    elif card.evidence:
+        ev = card.evidence
+        type_label = {
+            "event": "Actual event",
+            "cautionary": "Cautionary language",
+            "boilerplate": "Boilerplate / definition only",
+            "insufficient": "Insufficient evidence",
+        }.get(ev.evidence_type, ev.evidence_type)
+        evidence_html = (
+            '<ul class="fd-driver-bullets">'
+            f"<li><strong>What changed:</strong> {ev.what_changed}</li>"
+            f"<li><strong>Why the sentiment is negative:</strong> {ev.why_negative}</li>"
+            f"<li><strong>Evidence type:</strong> {type_label}</li>"
+            f"<li><strong>Confidence:</strong> {ev.confidence}</li>"
+            "</ul>"
+        )
+
+    why_html = (
+        f'<div class="fd-why"><b>Why it matters:</b> {card.why_it_matters}</div>'
+        if card.why_it_matters else ""
+    )
+    st.markdown(
+        f"""
+        <div class="fd-card">
+          <div class="fd-card-title">{card.topic}
+            <span class="fd-signal {cls}">{card.sentiment}</span>
+          </div>
+          <div>{card.narrative}</div>
+          {evidence_html}
+          {why_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if card.evidence and card.evidence.excerpt:
+        with st.expander(f"Source evidence for {card.topic}", expanded=False):
+            st.markdown(f"> \"{card.evidence.excerpt}\"")
 
 
 def _render_drivers(drivers: list[DriverNote]) -> None:
@@ -580,66 +766,408 @@ def _render_breakdown_with_commentary(
             )
 
 
-def _render_watch_items(items: list[WatchItem]) -> None:
-    """Render watch items split by classification.
+def _render_severe_red_flags(items: list[WatchItem]) -> None:
+    """Render the **Severe Red Flags** subsection only.
 
-    True red flags are shown prominently. Resolved (previously
-    disclosed, now removed) get a small constructive callout. Negated
-    and boilerplate items are tucked into a single collapsed expander
-    so they don't dilute the report.
+    Severe red flags mean actual events (going concern, covenant
+    breach, default, material weakness, investigation, impairment
+    charge, litigation update). Topic sentiment is rendered separately
+    by ``_render_cautionary_topic_cards``.
+
+    Resolved items and non-findings (negated / boilerplate / weak) are
+    rendered by their own helpers so each subsection stands alone.
     """
     true_flags = [w for w in items if w.classification == "true"]
+    ongoing = [w for w in items if w.classification == "ongoing"]
+
+    if not true_flags and not ongoing:
+        st.success(
+            "No severe red-flag events detected in changed disclosures."
+        )
+        return
+
+    for h in true_flags:
+        change_chip = (
+            f" — {h.change_type}" if h.change_type else " — present in filing"
+        )
+        st.markdown(
+            f"""
+            <div class="fd-finding">
+              <b>⚠️ True red flag: {h.phrase.title()}</b>
+              <span style="color:#6B7280">{change_chip} · Section: {h.section}</span>
+              <div style="margin-top:4px;font-size:0.82rem;color:#374151">
+                <i>Why it matters:</i> {h.why_it_matters}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    for h in ongoing:
+        st.markdown(
+            f"""
+            <div class="fd-finding" style="border-left-color:#D97706;background:#FEF3C7">
+              <b>Ongoing known issue: {h.phrase.title()}</b>
+              <span style="color:#6B7280"> — present in filing · Section: {h.section}</span>
+              <div style="margin-top:4px;font-size:0.82rem;color:#374151">
+                <i>Why it matters:</i> {h.why_it_matters}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with st.expander("Show evidence", expanded=False):
+        for h in true_flags + ongoing:
+            st.markdown(f"**{h.phrase.title()}** — \"{h.excerpt}\"")
+
+
+def _render_resolved_risks(items: list[WatchItem]) -> None:
+    """Render the **Resolved / Removed Prior Risks** subsection."""
     resolved = [w for w in items if w.classification == "resolved"]
+    if not resolved:
+        return
+    st.markdown(
+        ", ".join(sorted({w.phrase.title() for w in resolved}))
+    )
+
+
+def _render_non_findings(items: list[WatchItem]) -> None:
+    """Render the collapsed non-findings panel (negated / boilerplate / weak)."""
     negated = [w for w in items if w.classification == "negated"]
     boilerplate = [w for w in items if w.classification == "boilerplate"]
+    weak = [w for w in items if w.classification == "weak"]
+    buried = negated + boilerplate + weak
+    if not buried:
+        return
+    with st.expander(
+        f"Show non-findings ({len(buried)}): negated · boilerplate · weak evidence",
+        expanded=False,
+    ):
+        for w in negated:
+            st.markdown(
+                f"- *Mentioned but negated:* **{w.phrase.title()}** — the filing "
+                "mentions this phrase but explicitly negates it (e.g. \"None\" / \"Not applicable\")."
+            )
+        for w in boilerplate:
+            st.markdown(
+                f"- *Boilerplate / definition only:* **{w.phrase.title()}** — "
+                "appears inside a non-GAAP definition, a recurring SEC header "
+                "with \"None\", or a hypothetical contractual clause."
+            )
+        for w in weak:
+            st.markdown(
+                f"- *Weak evidence:* **{w.phrase.title()}** — keyword present "
+                "but no event-confirming context (e.g. \"notice of default\", "
+                "\"restructuring charges of $X million\"). Read the source."
+            )
 
-    if not true_flags:
-        st.success(
-            "No true red-flag language detected in this filing's "
-            "changed disclosures."
-        )
+
+# ---------------------------------------------------------------------------
+# 8-K event-intelligence tab
+# ---------------------------------------------------------------------------
+
+
+def _render_8k_header(ev: EightKEvent) -> None:
+    """Top banner: event type + item / exhibit / materiality chips."""
+    mat_cls = f"fd-8k-mat-{ev.materiality}"
+    mat_label = {"high": "High materiality", "medium": "Medium materiality", "low": "Low materiality"}.get(
+        ev.materiality, ev.materiality.title()
+    )
+    chips: list[str] = []
+    if ev.item_numbers:
+        for i in ev.item_numbers:
+            chips.append(f'<span class="fd-8k-chip">Item {i}</span>')
     else:
-        for h in true_flags:
-            change_chip = (
-                f" — {h.change_type}" if h.change_type else " — present in filing"
+        chips.append('<span class="fd-8k-chip fd-8k-mat-low">No item detected</span>')
+    if ev.exhibits:
+        for e in ev.exhibits:
+            chips.append(f'<span class="fd-8k-chip">Exhibit {e}</span>')
+    chips.append(f'<span class="fd-8k-chip {mat_cls}">{mat_label}</span>')
+
+    st.markdown(
+        f"""
+        <div class="fd-8k-header">
+          <div class="fd-8k-event-type">{ev.event_type}</div>
+          <div style="margin-top:4px;color:#0C4A6E;font-size:0.92rem;">
+            <b>Overall read:</b> {ev.overall_read}
+          </div>
+          <div class="fd-8k-meta">{''.join(chips)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if ev.item_descriptions:
+        with st.expander("Item detail", expanded=False):
+            for d in ev.item_descriptions:
+                st.markdown(f"- {d}")
+
+
+def _render_8k_metrics(metrics: list[KeyMetric]) -> None:
+    if not metrics:
+        st.write(
+            "_No press-release-style headline metrics detected. For an "
+            "Item 2.02 filing the press release often lives in a separate "
+            "Exhibit 99.1 document; open the SEC link above to view the full "
+            "earnings release._"
+        )
+        return
+    n_cols = min(3, len(metrics))
+    cols = st.columns(n_cols)
+    for i, m in enumerate(metrics):
+        with cols[i % n_cols]:
+            delta_html = (
+                f'<span class="fd-8k-metric-delta">{m.delta}</span>'
+                if m.delta else ""
             )
             st.markdown(
                 f"""
-                <div class="fd-finding">
-                  <b>⚠️ {h.phrase.title()}</b>
-                  <span style="color:#6B7280">{change_chip} · Section: {h.section}</span>
-                  <div style="margin-top:4px;font-size:0.82rem;color:#374151">
-                    <i>Why it matters:</i> {h.why_it_matters}
-                  </div>
+                <div class="fd-8k-metric">
+                  <div class="fd-8k-metric-label">{m.label}</div>
+                  <div class="fd-8k-metric-value">{m.value}{delta_html}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-        with st.expander("Show evidence", expanded=False):
-            for h in true_flags:
-                st.markdown(f"**{h.phrase.title()}** — \"{h.excerpt}\"")
 
-    if resolved:
+
+def _render_8k_highlights(highlights: list[Highlight]) -> None:
+    if not highlights:
+        st.write(
+            "_No customer / contract highlights detected in the primary "
+            "document. Press-release exhibits typically carry these in a "
+            "bullet list — see the source filing._"
+        )
+        return
+    for h in highlights:
         st.markdown(
-            "**Resolved / removed prior risks (constructive):** "
-            + ", ".join(sorted({w.phrase.title() for w in resolved}))
+            f"""
+            <div class="fd-8k-highlight">
+              <div class="fd-8k-highlight-title">{h.title}</div>
+              <div>{h.text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    if negated or boilerplate:
-        with st.expander(
-            f"Show mentioned-but-negated checks ({len(negated)+len(boilerplate)})",
-            expanded=False,
+
+def render_8k_tab(
+    company: Company,
+    form: str,
+    filings: list[Filing],
+    note: Optional[str] = None,
+) -> None:
+    """Dedicated 8-K event-intelligence tab.
+
+    Unlike the 10-Q / 10-K layout, the 8-K tab is built around the
+    single event the company disclosed, not period-over-period
+    comparatives. For an Item 2.02 earnings 8-K the substantive content
+    lives in Exhibit 99.1 -- the cover document is just a wrapper that
+    declares the items and references the exhibit -- so this tab
+    downloads and parses the relevant exhibits before running the
+    metric / highlight extractors.
+    """
+    from edgar import select_8k_exhibits, FilingDocument
+    from eightk import ExhibitParseStatus
+
+    if not filings:
+        st.warning(
+            f"No recent 8-K filings found for {company.name} ({company.ticker})."
+        )
+        return
+
+    latest = filings[0]
+
+    st.subheader(f"{company.name} ({company.ticker}) — 8-K")
+    st.markdown(
+        f"**Latest 8-K**  \n"
+        f"Filed: `{latest.filing_date}` · Reports period: `{latest.report_date}`  \n"
+        f"[Open on SEC EDGAR]({latest.primary_doc_url})"
+    )
+    st.caption(f"CIK: {company.cik}")
+    if note:
+        st.info(note)
+
+    with st.spinner("Downloading 8-K cover document…"):
+        try:
+            cover_paras_raw, cover_html = cached_filing(
+                company.cik, latest.accession_no, latest.primary_document,
+                latest.form, latest.filing_date, latest.report_date,
+            )
+            primary_parsed = True
+            primary_char_count = len(cover_html or "")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to fetch or parse 8-K cover: {exc}")
+            return
+
+    cover_paras = [Paragraph(**p) for p in cover_paras_raw]
+
+    # --- Discover exhibits and download the substantive ones -----------
+    with st.spinner("Looking for exhibits (EX-99.1, EX-99.2, EX-10, ...)…"):
+        try:
+            docs_raw = cached_filing_documents(company.cik, latest.accession_no)
+        except Exception:  # noqa: BLE001
+            docs_raw = []
+    docs = [FilingDocument(**d) for d in docs_raw]
+    targeted_exhibits = select_8k_exhibits(docs)
+
+    exhibit_paragraphs: list[Paragraph] = []
+    exhibits_status: list[ExhibitParseStatus] = []
+    if targeted_exhibits:
+        with st.spinner(f"Downloading {len(targeted_exhibits)} exhibit(s)…"):
+            for d in targeted_exhibits:
+                paras_raw, char_count = cached_exhibit_paragraphs(d.url)
+                parsed = bool(paras_raw)
+                exhibits_status.append(
+                    ExhibitParseStatus(
+                        doc_type=d.doc_type,
+                        name=d.name,
+                        url=d.url,
+                        parsed=parsed,
+                        char_count=char_count,
+                        note=None if parsed else "fetched but produced no paragraphs",
+                    )
+                )
+                if parsed:
+                    exhibit_paragraphs.extend(Paragraph(**p) for p in paras_raw)
+
+    # Guidance is best detected over the union of cover + exhibits.
+    guidance = extract_guidance(cover_paras + exhibit_paragraphs)
+    event = extract_8k_event(
+        cover_paras,
+        exhibit_paragraphs=exhibit_paragraphs,
+        guidance_notes=guidance,
+        issuer_name=company.name,
+        exhibits_status=exhibits_status,
+        primary_parsed=primary_parsed,
+        primary_char_count=primary_char_count,
+    )
+
+    st.divider()
+
+    # ----- A. Header -----------------------------------------------------
+    _render_8k_header(event)
+
+    # ----- B. Event Classification (item-level detail) -------------------
+    st.markdown("### Event Classification")
+    cols = st.columns(2)
+    with cols[0]:
+        if event.item_numbers:
+            for d in event.item_descriptions:
+                st.markdown(f"- {d}")
+        else:
+            st.markdown("- _No item numbers detected in cover document_")
+    with cols[1]:
+        if event.exhibits:
+            st.markdown("**Exhibits referenced:** " + ", ".join(
+                f"Exhibit {e}" for e in event.exhibits
+            ))
+        parsed_exhibits = [s for s in exhibits_status if s.parsed]
+        if parsed_exhibits:
+            st.markdown(
+                "**Exhibits parsed:** "
+                + ", ".join(f"{s.doc_type} ({s.char_count:,} chars)" for s in parsed_exhibits)
+            )
+
+    # ----- C. Event Summary ----------------------------------------------
+    st.markdown("### Event Summary")
+    st.write(event.event_summary)
+
+    # ----- D. Key Financial Metrics --------------------------------------
+    if "2.02" in event.item_numbers or event.key_metrics:
+        st.markdown("### Key Financial Metrics")
+        if event.key_metrics:
+            st.caption(
+                "Extracted from press-release language in Exhibit 99.1. "
+                "Verify against the GAAP / non-GAAP reconciliation in the source."
+            )
+            _render_8k_metrics(event.key_metrics)
+        elif event.exhibit_99_1_detected and not any(
+            s.parsed and s.doc_type.upper().startswith("EX-99.1") for s in exhibits_status
         ):
-            for w in negated:
+            st.warning(
+                "Exhibit 99.1 was detected but could not be parsed. The press "
+                "release content is therefore unavailable to this analysis. "
+                "Open the source filing directly for the as-released metrics."
+            )
+        else:
+            st.write(
+                "_Press-release-style headline metrics were not detected. "
+                "Open the source filing for the as-released financial table._"
+            )
+
+    # ----- E. Guidance / Outlook -----------------------------------------
+    st.markdown("### Guidance / Outlook")
+    if event.guidance_lines:
+        for g in event.guidance_lines:
+            st.markdown(
+                f"""
+                <div class="fd-guidance">
+                  <div>{g}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.write(
+            "_No specific forward-looking guidance with a quantitative "
+            "anchor detected in the parsed documents._"
+        )
+
+    # ----- F. Business Highlights ----------------------------------------
+    st.markdown("### Business Highlights")
+    _render_8k_highlights(event.highlights)
+
+    # ----- G. Investment Read --------------------------------------------
+    st.markdown("### Investment Read")
+    st.write(event.investment_read)
+
+    # ----- H. Source Evidence --------------------------------------------
+    if event.raw_excerpts:
+        with st.expander("Source evidence", expanded=False):
+            for ex in event.raw_excerpts:
+                st.markdown(f"> {ex}")
+
+    # --- Debug expander -------------------------------------------------
+    with st.expander("Parsing diagnostics", expanded=False):
+        st.markdown(
+            f"- **Primary 8-K document parsed:** "
+            f"{'yes' if event.primary_parsed else 'no'}"
+            f" ({event.primary_char_count:,} chars)"
+        )
+        st.markdown(
+            f"- **Exhibit 99.1 detected on cover:** "
+            f"{'yes' if event.exhibit_99_1_detected else 'no'}"
+        )
+        if exhibits_status:
+            for s in exhibits_status:
                 st.markdown(
-                    f"- *Negated:* **{w.phrase.title()}** — the filing mentions "
-                    "this phrase but explicitly negates it (e.g. \"None\" / \"Not applicable\")."
+                    f"- **{s.doc_type}** (`{s.name}`)  \n"
+                    f"  URL: {s.url}  \n"
+                    f"  Parsed: {'yes' if s.parsed else 'no'} "
+                    f"· chars: {s.char_count:,}"
+                    + (f"  \n  Note: {s.note}" if s.note else "")
                 )
-            for w in boilerplate:
-                st.markdown(
-                    f"- *Boilerplate:* **{w.phrase.title()}** — appears in a "
-                    "standard SEC disclosure header followed by \"None\" / \"Not applicable\"."
-                )
+        else:
+            st.markdown(
+                "- No exhibits in the targeted set (EX-99 / EX-10 / EX-2 / "
+                "EX-4 / EX-1) were listed in the filing index."
+            )
+        # Optional: full document list for inspection.
+        if docs:
+            other_docs = [d for d in docs if d not in targeted_exhibits]
+            if other_docs:
+                st.caption("Other files in the filing folder (not parsed):")
+                for d in other_docs[:30]:
+                    st.markdown(
+                        f"  - `{d.name}` — type `{d.doc_type or 'unknown'}`"
+                    )
+
+    st.divider()
+    st.caption(
+        "This output is AI-generated and rule-based. It may contain errors "
+        "and is for educational/research workflow purposes only, not "
+        "investment advice. Verify all conclusions against the original SEC "
+        "filings."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -859,21 +1387,55 @@ def render_filing_tab(
     # ----- 8. Risk / Legal / Controls -------------------------------------
     st.markdown("### Risk / Legal / Controls")
     st.caption(
-        "Watch items are classified as true / resolved / negated / "
-        "boilerplate. Only true red flags are shown prominently below."
+        "Severe red flags mean actual events (going concern, covenant "
+        "breach, default, material weakness, investigation, impairment "
+        "charge, litigation update). Topic sentiment is the tone of "
+        "disclosure language and is shown separately below."
     )
-    _render_watch_items(report.watch_items)
 
+    # --- Severe Red Flags ---------------------------------------------------
+    st.markdown("**Severe Red Flags**")
+    _render_severe_red_flags(report.watch_items)
+
+    # --- Resolved / Removed Prior Risks ------------------------------------
+    resolved_items = [w for w in report.watch_items if w.classification == "resolved"]
+    if resolved_items:
+        st.markdown("**Resolved / Removed Prior Risks**")
+        _render_resolved_risks(report.watch_items)
+
+    # --- Cautionary Disclosure Topics --------------------------------------
     risk_topics = {"Risk Factors", "Legal Proceedings", "Controls and Procedures"}
     risk_cards = [c for c in report.topic_cards if c.topic in risk_topics]
-    if risk_cards:
-        for c in risk_cards:
-            _render_topic_card(c)
+    cautionary_cards = [
+        c for c in risk_cards
+        if c.sentiment in ("Negative", "Slightly Negative", "Mixed")
+        and not c.downgraded_from
+    ]
+    neutralized_cards = [
+        c for c in risk_cards
+        if c.sentiment == "Neutral" or c.downgraded_from
+    ]
+
+    if cautionary_cards or neutralized_cards:
+        st.markdown("**Cautionary Disclosure Topics**")
+        if cautionary_cards:
+            st.caption(
+                "However, some disclosure categories still screen as "
+                "cautionary based on language changes or filing context."
+            )
+            for c in cautionary_cards:
+                _render_cautionary_topic_card(c)
+        if neutralized_cards:
+            for c in neutralized_cards:
+                _render_cautionary_topic_card(c)
     else:
         st.write(
             "_Risk, legal, and internal-controls disclosures appear "
             "broadly unchanged versus the prior comparable filing._"
         )
+
+    # --- Non-findings (collapsed) ------------------------------------------
+    _render_non_findings(report.watch_items)
     _render_evidence(report.ranked_changes, risk_topics)
 
     # ----- 9. Topic Sentiment Cards ---------------------------------------
@@ -958,11 +1520,10 @@ forms_to_show = [
     ("10-K", None),
     (
         "8-K",
-        "Note: 8-Ks are event-based filings. The latest and prior 8-K may "
-        "cover entirely different event types. Read the report as 'what "
-        "topics this disclosure touches' rather than 'how a fixed disclosure "
-        "evolved'. XBRL-driven Key Financials and Liquidity sections are "
-        "omitted for 8-K.",
+        "8-Ks are event-based filings. This tab is rendered as an "
+        "event-intelligence report: what event was disclosed, the item "
+        "numbers, exhibits, key financial metrics (for Item 2.02 earnings "
+        "releases), guidance, and customer / contract highlights.",
     ),
 ]
 
@@ -970,4 +1531,7 @@ tabs = st.tabs([f"📊 {f}" for f, _ in forms_to_show])
 for (form, note), tab in zip(forms_to_show, tabs):
     with tab:
         filings = latest_two_filings(submissions, form)
-        render_filing_tab(company, form, filings, facts, note=note)
+        if form == "8-K":
+            render_8k_tab(company, form, filings, note=note)
+        else:
+            render_filing_tab(company, form, filings, facts, note=note)

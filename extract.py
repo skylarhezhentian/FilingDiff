@@ -159,3 +159,54 @@ def extract_filing(filing: Filing) -> tuple[list[Paragraph], str]:
     """
     html = fetch_filing_text(filing)
     return html_to_paragraphs(html), html
+
+
+def html_to_press_release_text(html: str, min_chars: int = 30) -> list[Paragraph]:
+    """Press-release-friendly text extractor for 8-K exhibits.
+
+    Unlike ``html_to_paragraphs``, this function:
+      - Keeps tables (most of an earnings release's metrics live in
+        small inline tables, not narrative prose).
+      - Treats the bullet marker character ``●`` as a paragraph break
+        so each highlighted item becomes its own short paragraph.
+      - Uses a lower minimum-character cutoff because press releases
+        often have short bullets that still carry an entire metric.
+
+    Returns a list of Paragraph objects. Section labels are best-effort
+    and rarely useful for press releases, so they typically remain
+    "Unknown" -- consumers (eightk.py) join the text and run their own
+    regex extractors.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    raw = soup.get_text(separator="\n")
+    # Bullet marker -> newline so each ● item splits into its own line.
+    raw = re.sub(r"[•●■▪]", "\n", raw)
+    # Collapse whitespace per line, drop empties.
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw.split("\n")]
+
+    paragraphs: list[Paragraph] = []
+    current_section = "Unknown"
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if not buffer:
+            return
+        text = " ".join(buffer).strip()
+        if len(text) >= min_chars:
+            paragraphs.append(Paragraph(text=text, section=current_section))
+        buffer.clear()
+
+    for ln in lines:
+        if not ln:
+            flush()
+            continue
+        if _looks_like_heading(ln):
+            flush()
+            current_section = _classify_section(ln, current_section)
+            continue
+        buffer.append(ln)
+    flush()
+    return paragraphs

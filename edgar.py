@@ -160,6 +160,135 @@ def get_submissions(cik: str) -> dict:
     return http_get(url).json()
 
 
+# ---------------------------------------------------------------------------
+# Filing document discovery (cover + exhibits)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FilingDocument:
+    """One file inside a filing (cover doc, exhibit, supporting doc)."""
+
+    name: str  # filename inside the accession folder, e.g. "spire-ex99_1.htm"
+    doc_type: str  # SEC document type label, e.g. "8-K", "EX-99.1", "EX-10.1"
+    url: str  # absolute URL to fetch the document
+
+
+def _archive_dir_url(cik: str, accession_nodash: str) -> str:
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{int(cik)}/{accession_nodash}"
+    )
+
+
+def get_filing_documents(cik: str, accession_no: str) -> list[FilingDocument]:
+    """Return all documents in a filing by reading the EDGAR filing-index HTML.
+
+    The bare ``index.json`` SEC exposes for an accession only carries
+    icon-style ``type`` values like ``text.gif`` -- it does not include
+    the SEC document type label (``EX-99.1`` etc.). The filing-index
+    HTML page DOES have a real Type column, so we parse it instead.
+
+    Returns an empty list on any fetch / parse error so the caller can
+    fall back to using the primary document only.
+    """
+    accession_nodash = accession_no.replace("-", "")
+    dir_url = _archive_dir_url(cik, accession_nodash)
+    index_html_url = f"{dir_url}/{accession_no}-index.html"
+    try:
+        html = http_get(index_html_url).text
+    except Exception:  # noqa: BLE001
+        return []
+
+    # Lazy-import BeautifulSoup so callers that don't need this path
+    # don't pay the import cost.
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    docs: list[FilingDocument] = []
+    seen_names: set[str] = set()
+    for table in soup.find_all("table"):
+        header_cells = [c.get_text(strip=True).lower() for c in table.find_all("th")]
+        if "type" not in header_cells or "document" not in header_cells:
+            continue
+        # Resolve column indices from the header row.
+        col_idx = {name: i for i, name in enumerate(header_cells)}
+        i_doc = col_idx["document"]
+        i_type = col_idx["type"]
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if len(cells) <= max(i_doc, i_type):
+                continue
+            doc_cell = cells[i_doc]
+            type_cell = cells[i_type]
+            doc_type = type_cell.get_text(strip=True)
+            link = doc_cell.find("a")
+            if not link:
+                continue
+            href = link.get("href") or ""
+            # The link can be relative ("/Archives/...") or an iXBRL
+            # viewer wrapper ("/ix?doc=/Archives/..."); strip the
+            # wrapper and resolve to the raw file URL.
+            if href.startswith("/ix?doc="):
+                href = href[len("/ix?doc="):]
+            if href.startswith("/"):
+                url = f"https://www.sec.gov{href}"
+            else:
+                url = href
+            # Derive the filename for skip/dedup checks.
+            name = url.rsplit("/", 1)[-1]
+            if not name or name in seen_names:
+                continue
+            # Skip auto-generated index files.
+            if name.endswith(("-index.htm", "-index.html", "-index-headers.html")):
+                continue
+            seen_names.add(name)
+            docs.append(FilingDocument(name=name, doc_type=doc_type, url=url))
+    return docs
+
+
+# Exhibit types worth parsing for 8-K event intelligence, in priority
+# order. Anything not matched here is skipped (XBRL schemas, cover-page
+# interactive data, etc.).
+EIGHT_K_EXHIBIT_PRIORITY: list[tuple[str, str]] = [
+    ("EX-99.1", "Earnings release / press release / investor update"),
+    ("EX-99.2", "Presentation or supplemental information"),
+    ("EX-99",   "Additional exhibit content"),
+    ("EX-10",   "Material agreement"),
+    ("EX-2",    "Acquisition / merger agreement"),
+    ("EX-4",    "Securities / debt instrument"),
+    ("EX-1",    "Underwriting agreement"),
+]
+
+
+def select_8k_exhibits(docs: list[FilingDocument]) -> list[FilingDocument]:
+    """Pick the substantive exhibits from an 8-K's document list, ordered by priority.
+
+    Matching is prefix-based on the SEC document-type label so
+    ``EX-99.1`` and ``EX-99.2`` both match the ``EX-99`` family but the
+    more specific prefix wins. Each prefix may match multiple files
+    (e.g. EX-10.1 and EX-10.2). Only documents whose name looks like
+    parseable HTML/text are returned -- raw XBRL .xml or image files
+    are excluded.
+    """
+    skip_ext = (".xml", ".xsd", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".zip")
+    keepers: list[tuple[int, FilingDocument]] = []
+    seen_urls: set[str] = set()
+    for rank, (prefix, _label) in enumerate(EIGHT_K_EXHIBIT_PRIORITY):
+        for d in docs:
+            t = d.doc_type.upper()
+            if not (t == prefix or t.startswith(prefix + ".") or t.startswith(prefix + "-")):
+                continue
+            if d.url in seen_urls:
+                continue
+            if d.name.lower().endswith(skip_ext):
+                continue
+            seen_urls.add(d.url)
+            keepers.append((rank, d))
+    keepers.sort(key=lambda x: x[0])
+    return [d for _r, d in keepers]
+
+
 def latest_two_filings(submissions: dict, form: str) -> list[Filing]:
     """Return the latest and previous filings for a given form type.
 

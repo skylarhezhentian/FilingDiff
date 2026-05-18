@@ -93,6 +93,73 @@ GUIDANCE_HARD_SIGNALS = [
     "approximately", "in the range", "to be in the range",
 ]
 
+# A guidance sentence must mention at least one of these *business
+# performance* topics. This is the hard topic-allowlist that prevents
+# accounting / lease / RSU / tax sentences from sneaking through.
+GUIDANCE_ALLOWED_TOPICS = [
+    "revenue", "revenues", "net sales", "total sales",
+    "ebitda", "adjusted ebitda",
+    "eps", "earnings per share", "diluted eps",
+    "free cash flow", "fcf", "operating cash flow",
+    "capex", "capital expenditure", "capital expenditures",
+    "gross margin", "operating margin", "ebitda margin",
+    "operating income", "net income", "earnings",
+    "demand", "backlog", "bookings", "rpo",
+    "volume", "volumes", "shipment", "shipments",
+    "subscription revenue", "arr", "annual recurring",
+    "comparable sales", "same-store",
+    "growth", "growth rate",
+    "full year", "full-year", "fiscal year",
+    "quarter", "quarterly", "next quarter",
+    "outlook", "guidance",
+]
+
+# Reject contexts: sentences that mention any of these are accounting /
+# disclosure mechanics, not business-performance guidance, even if they
+# happen to contain "we expect" and a dollar figure.
+GUIDANCE_REJECT_CONTEXT = [
+    # Leases (Topic 842)
+    "operating lease", "right-of-use", "right of use", "rou asset",
+    "lease liability", "lease commitments", "minimum lease payments",
+    "lease term", "lease modification", "lease payments",
+    # Stock comp / RSU / ESPP
+    "restricted stock unit", "performance share unit",
+    "share-based compensation", "stock-based compensation",
+    "stock compensation expense", "compensation cost", "compensation expense",
+    "weighted average period", "weighted-average period",
+    "weighted-average remaining", "vesting period",
+    "recognize over a", "recognized over a", "recognize ratably",
+    "remaining unrecognized", "espp", "employee stock purchase",
+    # Accounting standards updates
+    "asu no", "asc no", "asc 8", "asc 6", "asc 3", "asc 9",
+    "accounting standards update", "topic 842", "topic 606", "topic 326",
+    "fasb", "early adoption", "adopt this standard", "adoption of",
+    # Tax timing
+    "tax provision", "deferred tax", "uncertain tax position",
+    "valuation allowance", "tax return", "effective tax rate",
+    "income tax expense", "tax expense", "income taxes payable",
+    "unrecognized tax benefit",
+    # Maturity / debt schedules
+    " matures ", "maturity date", "maturity of",
+    "principal amount of $", "weighted average interest rate",
+    "long-term debt of", "scheduled to mature", "due in fiscal",
+    "due in 20", "senior notes due", "credit facility matures",
+    # Pensions / OPEB
+    "pension plan", "benefit plan", "opeb", "postretirement",
+    "pension expense", "pension benefit", "actuarial",
+    # Derivatives / hedge accounting
+    "hedge accounting", "notional amount", "derivative instrument",
+    "cash flow hedge",
+    # Goodwill / impairment testing
+    "annual impairment test", "reporting unit", "goodwill impairment test",
+    # Inventory accounting
+    "inventory method", "lifo", "first-in, first-out",
+    # Warranty / loss contingency
+    "warranty obligation", "warranty liability",
+    # Restatement / adjustment language
+    "adjusted ebitda is defined", "non-gaap measure", "reconciliation",
+]
+
 # Driver-category dictionary: each entry maps a category label to the
 # keywords that, if present in the driver sentence, place the sentence
 # into that bucket. Order matters -- earlier categories win when a
@@ -1245,16 +1312,33 @@ def extract_drivers(paragraphs, *, max_per_category: int = 1) -> list[DriverNote
 
 
 def _is_real_guidance(sent: str) -> bool:
-    """Reject safe-harbor boilerplate; require a quantitative anchor or hard signal."""
+    """Strict gate: only true business-performance guidance is admitted.
+
+    A sentence must clear four bars:
+      1. No safe-harbor boilerplate phrases.
+      2. No accounting / lease / RSU / ASU / tax / maturity context.
+      3. At least one business-performance topic keyword (revenue,
+         EBITDA, EPS, margin, demand, backlog, volume, outlook, ...).
+      4. Either a quantitative anchor ($, %, range) or a hard guidance
+         signal word (raise / lower / reaffirm / target / range of /
+         approximately).
+    """
     low = sent.lower()
-    # Reject obvious risk-factor / safe-harbor boilerplate sentences.
+    # (1) Safe-harbor / forward-looking-statement disclaimers.
     if any(b in low for b in GUIDANCE_BOILERPLATE_PHRASES):
         return False
+    # (2) Accounting / disclosure mechanics that look superficially like
+    # forward statements but are not business-performance guidance.
+    if any(r in low for r in GUIDANCE_REJECT_CONTEXT):
+        return False
+    # (3) Must explicitly mention a business-performance topic.
+    if not any(t in low for t in GUIDANCE_ALLOWED_TOPICS):
+        return False
+    # (4) Must carry a number or hard signal.
     has_pct = bool(re.search(r"\d{1,3}(?:\.\d+)?\s*%", sent))
     has_dollar = bool(re.search(r"\$\s*\d", sent))
     has_signal = any(s in low for s in GUIDANCE_HARD_SIGNALS)
     has_range_lang = "range of" in low or "between $" in low or " to $" in low
-    # At least one hard signal or a quantitative anchor must be present.
     return has_pct or has_dollar or has_signal or has_range_lang
 
 
